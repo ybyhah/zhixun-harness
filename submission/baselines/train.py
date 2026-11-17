@@ -29,6 +29,12 @@ def _better_validation(task, current, best):
     return previous is None or (value > previous if task == "classification" else value < previous)
 
 
+def _nasa_score(predicted, expected):
+    error = np.asarray(predicted) - np.asarray(expected)
+    exponent = np.where(error >= 0, error / 10.0, -error / 13.0)
+    return float(np.sum(np.expm1(np.minimum(exponent, 600.0))))
+
+
 def metrics(model, data):
     predicted = model.predict(data["x"])
     expected = data["y"]
@@ -44,7 +50,11 @@ def metrics(model, data):
             result["severe_miss_rate"] = float(np.sum((expected == severe) & (labels != severe)) / count) if count else None
         return result
     error = predicted - expected
-    return {"mae": float(np.mean(np.abs(error))), "rmse": float(np.sqrt(np.mean(error ** 2)))}
+    result = {"mae": float(np.mean(np.abs(error))),
+              "rmse": float(np.sqrt(np.mean(error ** 2)))}
+    if model.meta.get("profile") == "C":
+        result["nasa_asymmetric_score"] = _nasa_score(predicted, expected)
+    return result
 
 
 def train_run(profile, train_path, validation_path, output, *, resume=None, epochs=None,
@@ -94,6 +104,8 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
     model.meta["profile"] = config["profile"]
     if bearing_rul:
         model.meta["target_unit"] = "minutes"
+    if config["profile"] == "C" and config["task"] == "regression":
+        model.meta["overestimate_weight"] = 1.5
     if learning_rate is not None:
         model.meta["learning_rate"] = learning_rate
     if batch_size is not None:
@@ -142,7 +154,8 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
                       "adam_beta1": .9, "adam_beta2": .999, "adam_epsilon": 1e-8, "gradient_clip_norm": 5.0,
                       "feature_clip": [-10.0, 10.0], "normalization": "initial_training_mean_std",
                       "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
-                      "requested_epochs": count, "classes": model.meta["classes"]},
+                      "requested_epochs": count, "classes": model.meta["classes"],
+                      "overestimate_weight": model.meta.get("overestimate_weight", 1.0)},
                   "source_sha256": {name: sha256((ROOT / name).read_bytes()) for name in ("model.py", "data.py", "train.py", "predict.py")},
                   "label_provenance": provenance, "created_at": datetime.now(timezone.utc).isoformat()}
         if bearing_rul:

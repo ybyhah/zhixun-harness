@@ -19,6 +19,10 @@ FORMAT = "contest.cpu-mlp.v1"
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 
 
+def _regression_weights(error, overestimate_weight):
+    return np.where(error > 0, float(overestimate_weight), 1.0)
+
+
 class Model:
     def __init__(self, task, paths, classes, x, y, *, hidden=32, seed=42, learning_rate=.003, batch_size=128):
         if task not in ("classification", "regression") or not 1 <= hidden <= 128:
@@ -70,6 +74,10 @@ class Model:
                 raise ValueError("invalid checkpoint numeric state")
         if not 0 < m["learning_rate"] <= 1 or m["target_scale"] <= 0:
             raise ValueError("invalid optimizer/scaler state")
+        weight = m.get("overestimate_weight", 1.0)
+        if (isinstance(weight, bool) or not isinstance(weight, (float, int))
+                or not math.isfinite(weight) or not 1 <= weight <= 10):
+            raise ValueError("invalid overestimate weight")
         input_size, hidden = len(m["paths"]), m["hidden"]
         output = len(classes) if m["task"] == "classification" else 1
         shapes = {"w1": (input_size, hidden), "b1": (hidden,), "w2": (hidden, output), "b2": (output,)}
@@ -127,8 +135,10 @@ class Model:
                     delta /= len(indices)
                 else:
                     error = logits[:, 0] - expected
-                    loss_sum += float(np.sum(error ** 2))
-                    delta = (2 * error / len(indices))[:, None]
+                    weights = _regression_weights(
+                        error, self.meta.get("overestimate_weight", 1.0))
+                    loss_sum += float(np.sum(weights * error ** 2))
+                    delta = (2 * weights * error / len(indices))[:, None]
                 gradients = {"w2": hidden.T @ delta, "b2": delta.sum(axis=0)}
                 hidden_delta = (delta @ self.params["w2"].T) * (1 - hidden ** 2)
                 gradients.update(w1=batch.T @ hidden_delta, b1=hidden_delta.sum(axis=0))

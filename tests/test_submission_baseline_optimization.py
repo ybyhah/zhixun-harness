@@ -10,6 +10,9 @@ SUBMISSION = ROOT / "submission"
 sys.path.insert(0, str(SUBMISSION))
 
 from baselines import train as baseline_train  # noqa: E402
+from baselines import model as baseline_model  # noqa: E402
+
+Model = baseline_model.Model
 
 
 def test_train_run_writes_best_intermediate_epoch(monkeypatch, tmp_path):
@@ -75,4 +78,62 @@ def test_train_run_writes_best_intermediate_epoch(monkeypatch, tmp_path):
     history = [json.loads(line) for line in
                (output / "history.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [item["epoch"] for item in history] == [1, 2, 3]
+
+
+def test_c_regression_weights_penalize_overestimation_only():
+    error = np.array([-1.0, 1.0])
+    assert np.array_equal(
+        baseline_model._regression_weights(error, 1.0), np.array([1.0, 1.0]))
+    assert np.array_equal(
+        baseline_model._regression_weights(error, 1.5), np.array([1.0, 1.5]))
+
+
+def test_c_weight_changes_training_loss_without_affecting_b_default():
+    x = np.array([[0.0], [0.0]])
+    y = np.array([0.0, 0.0])
+
+    def model(weight):
+        current = Model("regression", ["x"], [], x, y, hidden=1,
+                        seed=42, learning_rate=0.001, batch_size=2)
+        for value in current.params.values():
+            value.fill(0.0)
+        current.params["b2"].fill(1.0)
+        current.meta["overestimate_weight"] = weight
+        return current
+
+    b_loss = model(1.0).fit(x, y, 1)[0]
+    c_loss = model(1.5).fit(x, y, 1)[0]
+    assert c_loss == 1.5 * b_loss
+
+
+def test_nasa_score_penalizes_equal_overestimate_more_than_underestimate():
+    over = baseline_train._nasa_score(np.array([11.0]), np.array([1.0]))
+    under = baseline_train._nasa_score(np.array([0.0]), np.array([10.0]))
+    assert over > under > 0
+
+
+def test_c_train_run_persists_safety_weight_and_nasa_metric(tmp_path):
+    train_path = tmp_path / "train.jsonl"
+    validation_path = tmp_path / "validation.jsonl"
+    train_rows = [
+        {"id": f"t{i}", "inputs": {"x": float(i)}, "answer": float(12 - i)}
+        for i in range(4)
+    ]
+    validation_rows = [
+        {"id": f"v{i}", "inputs": {"x": float(i) + 0.5}, "answer": float(10 - i)}
+        for i in range(2)
+    ]
+    train_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in train_rows), encoding="utf-8")
+    validation_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in validation_rows), encoding="utf-8")
+
+    output = tmp_path / "c-candidate"
+    report = baseline_train.train_run(
+        "C", train_path, validation_path, output, epochs=1)
+    saved = Model.load(output / "checkpoint.npz")
+
+    assert saved.meta["overestimate_weight"] == 1.5
+    assert report["configuration"]["overestimate_weight"] == 1.5
+    assert report["best_validation"]["nasa_asymmetric_score"] >= 0
 
