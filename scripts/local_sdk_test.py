@@ -47,6 +47,7 @@ class _Parent:
     def __init__(self, ckpt):
         self._ckpt = ckpt
         self.artifact_id = "parent-artifact-0"
+        self.receipt = {"artifact_id": self.artifact_id}
 
     def path(self, relative):
         assert relative == "checkpoint.npz", relative
@@ -55,22 +56,27 @@ class _Parent:
 
 class FakeRound:
     """进程内替身：只实现 contest_submission.train 用到的接口。"""
-    def __init__(self, pkg, work):
+    def __init__(self, pkg, work, *, summary=None, history=None, round_index=1):
         self.dataset_key = "A"
-        self.task = {"task": "classification", "metric": "macro_f1", "higher_is_better": True}
-        self.round_index = 1
+        self.task = {"task": "classification", "metric": "macro_f1",
+                     "metric_direction": "higher"}
+        self.round_index = round_index
         self.max_output_tokens = 512
         self.data = _Data(pkg)
         self.parent = _Parent(pkg / "checkpoint.npz")
         self.call_ids = []
+        self.summary = summary or {"macro_f1": 0.80}
+        self._history = history or []
         self.submitted = None
         self.finished = None
 
     def history(self):
-        return []
+        return self._history
 
     def model(self, messages, **options):
         assert isinstance(messages, list) and messages and "max_tokens" in options
+        assert options["response_format"] == {"type": "json_object"}
+        assert options["max_tokens"] <= 256
         self.call_ids.append("call-local-1")
 
         class R:
@@ -82,19 +88,20 @@ class FakeRound:
         assert (Path(directory) / "checkpoint.npz").is_file(), "候选缺少 checkpoint"
         assert kw["checkpoint_paths"] == ["checkpoint.npz"] and kw["predict_argv"][-1] == "predict"
         self.submitted = {"artifact_id": "artifact-local-1", **kw}
-        return {"artifact_id": "artifact-local-1", "summary": {"metrics": {}}}
+        return {"artifact_id": "artifact-local-1", "summary": {"metrics": self.summary}}
 
     def finish(self, **kw):
         assert kw["model_call_ids"], "finish 的 model_call_ids 不能为空"
         self.finished = kw
 
 
-def _run_train(decide_hook):
+def _run_train(decide_hook, *, summary=None, history=None, round_index=1):
     """跑一轮 train，用 decide_hook 替换门控，返回 (rnd, cand_ckpt, report)。"""
     import contest_submission
     tmp = tempfile.mkdtemp(prefix="sdk-local-")
     os.environ["CONTEST_WORK"] = tmp
-    rnd = FakeRound(PKG_A, Path(tmp))
+    rnd = FakeRound(PKG_A, Path(tmp), summary=summary, history=history,
+                    round_index=round_index)
     orig = contest_submission._decide_promote
     contest_submission._decide_promote = decide_hook
     try:
@@ -117,7 +124,13 @@ def test_train_promote():
 
 
 def test_train_keep_parent():
-    rnd, _, _ = _run_train(lambda *a, **k: (False, {"p_better": 0.3}))
+    history = [{"id": "round-1", "round_index": 1,
+                "selected_artifact_id": "parent-artifact-0",
+                "summary": {"metrics": {"macro_f1": 0.80}},
+                "configuration": {"epochs": 5, "learning_rate": 0.001}}]
+    rnd, _, _ = _run_train(
+        lambda *a, **k: (True, {"p_better": 1.0}),
+        summary={"macro_f1": 0.79}, history=history, round_index=2)
     assert rnd.finished["selected_artifact_id"] == "parent-artifact-0", "不显著应保留父模型"
     assert "保留父模型" in rnd.finished["reason"]
     print("[train/keep] ok: 保留父模型，reason=", rnd.finished["reason"][:40], "…")

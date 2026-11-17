@@ -5,6 +5,7 @@
 自评无效：候选分数由平台 submit_candidate 后测量。
 """
 import json
+import math
 import os
 import subprocess
 import sys
@@ -27,6 +28,144 @@ def _extract_json(text):
     if start < 0 or end <= start:
         raise ValueError("模型回复没有 JSON 对象")
     return json.loads(text[start:end + 1])
+
+
+def _finite_number(value):
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value))
+
+
+def _summary_metrics(value):
+    """Extract finite platform metrics from a candidate or artifact receipt."""
+    if not isinstance(value, dict):
+        return {}
+    summary = value.get("summary")
+    if isinstance(summary, dict) and isinstance(summary.get("metrics"), dict):
+        metrics = summary["metrics"]
+    elif isinstance(value.get("metrics"), dict):
+        metrics = value["metrics"]
+    else:
+        return {}
+    return {str(k): v for k, v in metrics.items() if _finite_number(v)}
+
+
+def _history_metrics(record):
+    metrics = _summary_metrics(record)
+    if metrics:
+        return metrics
+    if not isinstance(record, dict):
+        return {}
+    config = record.get("configuration")
+    if isinstance(config, dict) and isinstance(config.get("platform_metrics"), dict):
+        return {str(k): v for k, v in config["platform_metrics"].items()
+                if _finite_number(v)}
+    return {}
+
+
+def _metric_value(metrics, name):
+    if not isinstance(metrics, dict):
+        return None
+    wanted = "".join(c for c in str(name).lower() if c.isalnum())
+    for key, value in metrics.items():
+        normalized = "".join(c for c in str(key).lower() if c.isalnum())
+        if normalized == wanted and _finite_number(value):
+            return float(value)
+    return None
+
+
+def _nasa_value(metrics):
+    if not isinstance(metrics, dict):
+        return None
+    for key, value in metrics.items():
+        if "nasa" in str(key).lower() and _finite_number(value):
+            return float(value)
+    return None
+
+
+def _select_from_platform(*, task, metric, direction, candidate, parent,
+                          first_round, dataset_key=None):
+    """Choose from authoritative platform metrics; local scores never decide."""
+    del task
+    cand = _metric_value(candidate, metric)
+    prev = _metric_value(parent, metric)
+    detail = {"source": "platform", "metric": metric, "direction": direction,
+              "candidate": cand, "parent": prev}
+    if cand is None:
+        return False, {**detail, "reason": "candidate_metric_missing"}
+    if prev is None:
+        reason = "first_round_valid_candidate" if first_round else "parent_metric_missing"
+        return bool(first_round), {**detail, "reason": reason}
+    better = cand > prev if direction == "higher" else cand < prev
+    if not better:
+        return False, {**detail, "reason": "candidate_not_better"}
+    if str(dataset_key).upper() == "C":
+        cand_nasa, prev_nasa = _nasa_value(candidate), _nasa_value(parent)
+        if cand_nasa is not None and prev_nasa is not None and cand_nasa > prev_nasa:
+            return False, {**detail, "reason": "nasa_stability_veto",
+                           "candidate_nasa": cand_nasa, "parent_nasa": prev_nasa}
+    return True, {**detail, "reason": "candidate_better"}
+
+
+def _history_prompt(history):
+    lines = []
+    for record in history[-6:]:
+        config = record.get("configuration") if isinstance(record, dict) else {}
+        config = config if isinstance(config, dict) else {}
+        metrics = _history_metrics(record)
+        lines.append(
+            f"  轮{record.get('round_index', '?')}: "
+            f"platform_metrics={json.dumps(metrics, ensure_ascii=False)}; "
+            f"epochs={config.get('epochs', '?')}; lr={config.get('learning_rate', '?')}; "
+            f"selected={record.get('selected_artifact_id', '?')}"
+        )
+    return "\n".join(lines) if lines else "  （暂无历史）"
+
+
+def _parent_metrics(rnd, history):
+    receipt = getattr(getattr(rnd, "parent", None), "receipt", {})
+    metrics = _summary_metrics(receipt)
+    if metrics:
+        return metrics
+    parent_id = getattr(getattr(rnd, "parent", None), "artifact_id", None)
+    for record in reversed(history):
+        if record.get("selected_artifact_id") == parent_id:
+            metrics = _history_metrics(record)
+            if metrics:
+                return metrics
+    task_contract = getattr(rnd, "task", {})
+    if isinstance(task_contract, dict):
+        for key in ("parent_metrics", "baseline_metrics"):
+            metrics = _summary_metrics({"metrics": task_contract.get(key)})
+            if metrics:
+                return metrics
+    for record in reversed(history):
+        metrics = _history_metrics(record)
+        if metrics:
+            return metrics
+    return {}
+
+
+def _avoid_repeat(parent_artifact_id, epochs, lr, history):
+    if lr is None:
+        return epochs, lr
+    tried = set()
+    for record in history:
+        config = record.get("configuration") if isinstance(record, dict) else None
+        if not isinstance(config, dict) or config.get("parent_artifact_id") != parent_artifact_id:
+            continue
+        old_epochs, old_lr = config.get("epochs"), config.get("learning_rate")
+        if isinstance(old_epochs, int) and _finite_number(old_lr):
+            tried.add((old_epochs, float(old_lr)))
+    current = (epochs, float(lr))
+    if current not in tried:
+        return current
+    alternatives = [
+        (epochs, float(_clamp(lr / 2, *LR_RANGE))),
+        (epochs, float(_clamp(lr * 2, *LR_RANGE))),
+        (max(EPOCH_RANGE[0], epochs // 2), float(lr)),
+        (min(EPOCH_RANGE[1], epochs * 2), float(lr)),
+    ]
+    return next((item for item in alternatives if item not in tried), current)
 
 
 def predict(sample, model_dir):
@@ -52,11 +191,7 @@ def _ask_model(rnd, task, metric, history):
     """
     hib = rnd.task.get("metric_direction", "higher" if task == "classification" else "lower") == "higher"
     direction = "越大越好" if hib else "越小越好"
-    lines = []
-    for h in history[-6:]:
-        v = h.get("validation_after") or h.get("metrics") or {}
-        lines.append(f"  轮{h.get('round_index', '?')}: {json.dumps(v, ensure_ascii=False)}")
-    hist = "\n".join(lines) if lines else "  （暂无历史）"
+    hist = _history_prompt(history)
     user = (
         f"数据集 {rnd.dataset_key}，任务 {task}，主指标 {metric}（{direction}）。\n"
         f"本轮从父检查点续训，梯度只用公开训练集。历史检查点表现：\n{hist}\n\n"
@@ -64,8 +199,10 @@ def _ask_model(rnd, task, metric, history):
         '{"epochs": 整数1-50, "learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}'
     )
     epochs, lr, hypothesis = 5, None, "回退官方默认超参续训一轮"
-    receipt = rnd.model([{"role": "user", "content": user}],
-                        max_tokens=min(512, rnd.max_output_tokens), temperature=0)
+    receipt = rnd.model(
+        [{"role": "user", "content": user}],
+        max_tokens=min(256, rnd.max_output_tokens), temperature=0,
+        response_format={"type": "json_object"})
     try:
         data = _extract_json(receipt.text)
         epochs = int(_clamp(int(data["epochs"]), *EPOCH_RANGE))
@@ -74,6 +211,10 @@ def _ask_model(rnd, task, metric, history):
             hypothesis = data["hypothesis"].strip()[:2000]
     except Exception as exc:  # noqa: BLE001 —— 慢通路失败回退，不中断本轮
         hypothesis = f"模型回复不可用（{type(exc).__name__}），回退官方默认超参"
+    adjusted = _avoid_repeat(rnd.parent.artifact_id, epochs, lr, history)
+    if adjusted != (epochs, lr):
+        epochs, lr = adjusted
+        hypothesis += "；检测到同一父模型下重复配置，已确定性换轴"
     return epochs, lr, hypothesis, receipt.call_id
 
 
@@ -111,6 +252,8 @@ def _decide_promote(rnd, task, parent_ckpt, cand_ckpt, report):
 def train(rnd):
     task = rnd.task["task"]
     metric = rnd.task.get("metric", "macro_f1" if task == "classification" else "rmse")
+    direction = rnd.task.get("metric_direction",
+                             "higher" if task == "classification" else "lower")
     parent_ckpt = rnd.parent.path("checkpoint.npz")          # 摘要校验在 /previous 完成
     history = rnd.history()
     epochs, lr, hypothesis, call_id = _ask_model(rnd, task, metric, history)
@@ -137,6 +280,7 @@ def train(rnd):
             change_summary=f"续训子进程失败，本轮保留父模型（{err}）"[:3900],
             reason=f"官方续训失败：{err}；为保证无人干预跑完，保留父模型。模型调用 {call_id}。",
             configuration={"epochs": epochs, "learning_rate": lr,
+                           "parent_artifact_id": rnd.parent.artifact_id,
                            "model_call_id": call_id, "train_failed": err},
             seed=42, history_ids=[h["id"] for h in history],
             model_call_ids=list(rnd.call_ids))
@@ -144,27 +288,44 @@ def train(rnd):
     report = json.loads((cand / "training.json").read_text())
     after = report.get("validation_after", {})
 
-    # 门控：候选是否显著优于父模型；否则保留父模型（抗过拟合/稳定性）
-    promote, decision = _decide_promote(rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
+    # 本地配对检验只作诊断；上线选择严格以平台 submit_candidate 返回摘要为准。
+    _, local_diagnostic = _decide_promote(
+        rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
     change = f"从父检查点续训 epochs={epochs} lr={lr if lr is not None else '默认'}"
     seed = int(report.get("seed", 42))
     configuration = {"epochs": epochs, "learning_rate": lr, "model_call_id": call_id,
-                     "validation_after": after, "decision": decision}
+                     "parent_artifact_id": rnd.parent.artifact_id,
+                     "local_validation_after": after,
+                     "local_diagnostic": local_diagnostic}
     submitted = rnd.submit_candidate(
         cand, hypothesis=hypothesis, change_summary=change,
         configuration=configuration, seed=seed,
         checkpoint_paths=["checkpoint.npz"], code_paths=[], predict_argv=PREDICT_ARGV)
 
+    candidate_metrics = _summary_metrics({"summary": submitted.get("summary")})
+    parent_metrics = _parent_metrics(rnd, history)
+    promote, platform_decision = _select_from_platform(
+        task=task, metric=metric, direction=direction,
+        candidate=candidate_metrics, parent=parent_metrics,
+        first_round=rnd.round_index == 1, dataset_key=rnd.dataset_key)
+    finish_configuration = {
+        **configuration,
+        "platform_metrics": candidate_metrics,
+        "parent_platform_metrics": parent_metrics,
+        "platform_decision": platform_decision,
+    }
     if promote:
         selected, verdict = submitted["artifact_id"], "采纳候选"
     else:
         selected, verdict = rnd.parent.artifact_id, "保留父模型"
-    reason = (f"门控判定：{verdict}。模型建议调用 {call_id}；"
-              f"候选 vs 父模型比较={json.dumps(decision, ensure_ascii=False)}"[:3900])
+    reason = (f"平台摘要判定：{verdict}。模型建议调用 {call_id}；"
+              f"平台候选指标={json.dumps(candidate_metrics, ensure_ascii=False)}；"
+              f"平台父模型指标={json.dumps(parent_metrics, ensure_ascii=False)}；"
+              f"判定={json.dumps(platform_decision, ensure_ascii=False)}"[:3900])
     rnd.finish(
         selected_artifact_id=selected,
         hypothesis=hypothesis, change_summary=change,
-        reason=reason, configuration=configuration, seed=seed,
+        reason=reason, configuration=finish_configuration, seed=seed,
         history_ids=[h["id"] for h in history],
         model_call_ids=list(rnd.call_ids))
 

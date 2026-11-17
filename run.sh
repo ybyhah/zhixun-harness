@@ -16,8 +16,6 @@
 #   VERIFY    0 | 1（默认 1；跑完做硬约束自检）
 # 额外命令行参数会原样透传给 scripts/run_official.py。
 
-set -uo pipefail
-
 BASE_DIR="${BASE_DIR:-/app/base}"
 TASKS="${TASKS:-a,b,c}"
 ROUNDS="${ROUNDS:-10}"

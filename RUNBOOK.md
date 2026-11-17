@@ -1,9 +1,36 @@
-# 运行说明（复现文档）
+# 运行说明（正式提交与本地复现）
 
 > 评分对象是官方 `base/` 三个包里的 CPU NumPy MLP，从随包 `checkpoint.npz` **续训**。
 > 本项目是驱动这一续训过程的 Harness。
 
-## 1. 镜像
+## 1. 正式平台 SDK 镜像
+
+正式提交使用 `contest.harness.workspace.v2`，只构建 `submission/Dockerfile`：
+
+```bash
+docker buildx build --platform linux/amd64 --provenance=false --sbom=false --load \
+  -t zhixun-submit -f submission/Dockerfile .
+```
+
+固定入口由平台驱动：
+
+```text
+python3 /app/harness.py describe
+python3 /app/harness.py train
+python3 /app/harness.py predict
+```
+
+模型只通过 SDK 的 `rnd.model()` 调用，PyTRiO 密钥由平台持有。公开训练/验证投影、父产物和工作目录分别由平台挂载到 `/data`、`/previous` 和 `/workspace`，不使用下面的本地 `base/` 挂载命令。
+
+本地只验证 `describe`：
+
+```bash
+docker run --rm zhixun-submit describe
+```
+
+> 根目录 `Dockerfile` 和 `run.sh` 是旧版本地实验镜像，不能作为正式平台提交物。
+
+## 2. 本地实验镜像（非平台提交物）
 
 | 项 | 值 |
 |---|---|
@@ -15,13 +42,13 @@
 镜像刻意不打包 `base/`：官方说明数据包"上传至指定平台固定目录下"，由平台提供；
 同时避免任何"打包权重"的争议。运行时挂载即可。
 
-### 构建
+### 构建本地实验镜像
 
 ```bash
 docker build -t zhixun-harness .
 ```
 
-## 2. 一键运行
+## 3. 本地一键运行
 
 ```bash
 mkdir -p outputs-docker
@@ -73,7 +100,7 @@ docker run --rm -e TASKS=a -e ROUNDS=5 \
 
 缺挂载时不会静默跑空——会打印挂载示例并以退出码 2 退出。
 
-## 3. 宿主机直接运行（不用 Docker）
+## 4. 宿主机直接运行（不用 Docker）
 
 ```bash
 python3 -m pip install -r requirements-docker.txt      # 官方路径只需 numpy
@@ -87,7 +114,7 @@ python3 -m pip install -r requirements.txt
 python3 scripts/run_loop.py --config configs/a1_gas.yaml
 ```
 
-## 4. 实测结果
+## 5. 实测结果
 
 ### 容器内（离线、4 核 8G 限制）
 
@@ -109,7 +136,7 @@ python3 scripts/run_loop.py --config configs/a1_gas.yaml
 
 同样 3 轮、固定种子 42，A 的逐轮值在容器与宿主机**逐位相同**，可复现（C11）。
 
-## 5. 硬约束自检
+## 6. 硬约束自检
 
 ```bash
 python3 scripts/verify_contest_conditions.py          # 宿主机
@@ -129,7 +156,7 @@ python3 scripts/verify_contest_conditions.py          # 宿主机
 | C10 不低于官方基线 | 通过，三包全优于 |
 | C11 一键运行、可复现 | 通过，固定种子两次一致 |
 
-## 6. 产出文件
+## 7. 产出文件
 
 | 路径 | 内容 |
 |---|---|

@@ -1,4 +1,5 @@
-# 智训引擎 Harness —— 驱动官方 base/ 包续训的一键运行镜像
+# 本地开发镜像（非平台提交物）—— 驱动官方 base/ 包续训的一键运行镜像
+# 正式平台提交必须使用 submission/Dockerfile（contest.harness.workspace.v2）。
 #
 # 设计要点：
 #   - 只装官方评分路径必需的依赖（numpy + 可选 swanlab），镜像远小于 2GB（C5）
