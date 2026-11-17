@@ -140,6 +140,19 @@ def test_avoid_repeat_changes_duplicate_configuration():
     assert cs._avoid_repeat("parent-0", 5, 0.001, history) != (5, 0.001)
 
 
+@pytest.mark.parametrize("round_index", [1, 2])
+def test_a_early_round_strategy_uses_strong_known_start(round_index):
+    epochs, lr, reason = cs._apply_profile_strategy(
+        "A", round_index, 3, 0.0005, [], "parent-a")
+    assert (epochs, lr) == (10, 0.01)
+    assert "A_early_round" in reason
+
+
+def test_a_third_round_keeps_qwen_proposal():
+    assert cs._apply_profile_strategy(
+        "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, "")
+
+
 class _Parent:
     artifact_id = "parent-1"
     receipt = {"artifact_id": "parent-1"}

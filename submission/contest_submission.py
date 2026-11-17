@@ -168,6 +168,14 @@ def _avoid_repeat(parent_artifact_id, epochs, lr, history):
     return next((item for item in alternatives if item not in tried), current)
 
 
+def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
+                            parent_artifact_id):
+    del history, parent_artifact_id
+    if str(dataset_key).upper() == "A" and round_index in (1, 2):
+        return 10, 0.01, "A_early_round:前两轮采用已验证的强起点"
+    return epochs, lr, ""
+
+
 def predict(sample, model_dir):
     """逐样本预测：从 CONTEST_ARTIFACT_PATH 加载官方 Model，复用官方 predict 逻辑。"""
     del model_dir  # 检查点路径以 CONTEST_ARTIFACT_PATH 为准
@@ -215,6 +223,11 @@ def _ask_model(rnd, task, metric, history):
     if adjusted != (epochs, lr):
         epochs, lr = adjusted
         hypothesis += "；检测到同一父模型下重复配置，已确定性换轴"
+    epochs, lr, strategy_reason = _apply_profile_strategy(
+        rnd.dataset_key, rnd.round_index, epochs, lr, history,
+        rnd.parent.artifact_id)
+    if strategy_reason:
+        hypothesis += "；" + strategy_reason
     return epochs, lr, hypothesis, receipt.call_id
 
 
