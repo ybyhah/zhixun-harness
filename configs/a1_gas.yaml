@@ -1,0 +1,70 @@
+# A1 气体传感器漂移任务配置
+seed: 42
+
+task:
+  name: a1_gas
+  adapter: gas_sensor
+  type: classification
+  metric: macro_f1          # macro_f1 | accuracy
+  n_classes: 6
+
+data:
+  raw_dir: data/raw
+  n_batches: 10
+  standardize: true         # scaler 只用已见批次拟合
+
+model:
+  backend: hist             # hist(sklearn HistGradientBoosting) | lgbm
+  params:
+    max_iter: 200
+    learning_rate: 0.1
+    max_depth: 8
+    min_samples_leaf: 10
+    l2_regularization: 1.0
+  calibrate: false          # 概率校准由决策动作按需开启
+  decay: 0.7                # 时间衰减权重基数，越小越偏向新数据（实测优于 0.9）
+
+# 训练预算：样本越多迭代越少，让单次训练的计算量大致恒定
+budget:
+  enabled: true
+  small_n: 1200             # 低于该样本量时用 min_iter
+  min_iter: 200             # 小样本时的迭代数
+  floor_iter: 40            # 自适应后的迭代数下限
+  max_train_samples: 3000   # 单次训练样本上限，超出按类别分层下采样
+
+monitor:
+  psi_bins: 10
+  psi_threshold: 0.25       # 单特征 PSI 告警线
+  psi_feature_ratio: 0.15   # 超过该比例的特征告警才算分布漂移
+  ks_alpha: 0.05
+  pca_components: 8
+  pca_threshold: 2.0        # 重构误差相对基线的倍数
+  perf_drop: 0.03           # 性能下降绝对值阈值（0.05 会漏掉可救的退化）
+  label_shift_threshold: 0.2  # 类别占比 L1 距离阈值
+  error_detector: adwin     # adwin | ddm | none
+
+gate:
+  val_frac: 0.3              # 从最近批次切出的验证比例，门控在其上判定
+  val_mode: in_batch         # in_batch(默认) | holdout_recent(整批留出做时序验证)
+  min_gain: 0.005           # 提升不足该值不切换，避免噪声抖动
+  forget_tol: 0.02          # 回放集允许的退化上限
+  replay_per_batch: 60      # 每批次留多少样本进回放集
+  replay_capacity: 600
+  max_consecutive_failures: 3
+
+loop:
+  min_batch_size: 30        # 低于此样本量只累积不更新
+  min_window_samples: 800   # 窗口重训的最小样本量，不足则自动扩展窗口
+  max_candidates: 2         # 单批次最多尝试几个候选动作，门控择优
+  max_trainings_per_batch: 3
+  train_timeout_s: 60
+  max_total_trainings: 60
+  decider: rules            # rules | llm(第二阶段)
+
+record:
+  audit_path: outputs/audit.jsonl
+  swanlab:
+    enabled: false          # 默认关闭，离线也可运行；加 --swanlab 或 enabled=true 启用
+    project: zhixun-harness
+    mode: offline           # offline(落本地 swanlog，赛后上传) | cloud
+    public: true            # 上传后需在网页端设为公开（C8）

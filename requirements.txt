@@ -1,0 +1,29 @@
+# 工业模型自进化系统 - 本地开发依赖
+# Python >= 3.10
+#
+# 注意：提交镜像**不用**这个文件，用 requirements-docker.txt（只有 numpy + swanlab）。
+# 下面的 pandas / scikit-learn / scipy / matplotlib / frouros 只被"自研对照闭环"
+# (src/harness/, scripts/run_loop.py) 使用，不在官方评分路径上。
+
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+scipy>=1.10
+PyYAML>=6.0
+matplotlib>=3.7
+
+# 漂移检测
+frouros>=0.9
+
+# 实验记录
+swanlab>=0.10
+
+# 可选模型后端（Linux 下可用；macOS 需先 brew install libomp）
+# lightgbm>=4.0
+
+# 测试
+pytest>=7.0
+
+# 仅本地基线对比用（scripts/bench_external.py），不进提交镜像
+# river>=0.21        # 在线学习基线 HAT/ARF（BSD-3）
+# nannyml>=0.13      # 无标签性能估计 CBPE（Apache-2.0）

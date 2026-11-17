@@ -1,0 +1,33 @@
+# 构建上下文只需要代码：官方包、数据、产出、参考仓库一律排除
+# 目的：镜像 ≤2GB（C5）、不打包权重与数据、构建上下文保持在几百 KB
+
+base/
+data/
+outputs/
+outputs-docker/
+backup/
+third_party/
+swanlog/
+
+.git/
+.gitignore
+.comate/
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
+
+*.rar
+*.npz
+*.pdf
+*.png
+*.csv
+*.jsonl
+
+.DS_Store
+.env
+.env.*
+*.tar
+venv/
+.venv/
+requirements.txt
+比赛要求汇总.md

@@ -1,0 +1,75 @@
+# A3 发动机剩余寿命（C-MAPSS）回归任务配置
+seed: 42
+
+task:
+  name: a3_cmapss
+  adapter: cmapss
+  type: regression
+  metric: rmse              # rmse | asym
+
+data:
+  raw_dir: data/CMAPSSData
+  standardize: true
+  stream_mode: progressive  # progressive(FD001→FD003→FD002→FD004) | single
+  rul_cap: 125
+  batches_per_subset: 3     # progressive 模式下每子集切几批
+  single_subset: FD001
+  n_batches: 10             # single 模式下切几批
+  drop_constant_sensors: true
+
+model:
+  backend: hist
+  params:
+    max_iter: 200
+    learning_rate: 0.1
+    max_depth: 8
+    min_samples_leaf: 20
+    l2_regularization: 1.0
+  decay: 0.8
+
+budget:
+  enabled: true
+  small_n: 2000
+  min_iter: 200
+  floor_iter: 40
+  max_train_samples: 8000
+
+monitor:
+  psi_bins: 10
+  psi_threshold: 0.25
+  psi_feature_ratio: 0.2
+  ks_alpha: 0.05
+  pca_components: 8
+  pca_threshold: 2.0
+  perf_drop: 3.0            # RMSE 的统一 score(-RMSE)下降超过该值算性能下降
+  label_shift_threshold: 0.25   # 目标值分布漂移(KS)阈值
+  error_detector: none     # 回归无 0/1 误差流，关闭 ADWIN
+
+gate:
+  val_frac: 0.3
+  val_mode: in_batch
+  min_gain: 0.2            # -RMSE 的最小提升
+  forget_tol: 2.0         # 回放集上 -RMSE 允许的退化
+  replay_per_batch: 200
+  replay_capacity: 2000
+  max_consecutive_failures: 3
+
+loop:
+  min_batch_size: 50
+  min_window_samples: 2000
+  max_candidates: 2
+  max_trainings_per_batch: 3
+  train_timeout_s: 60
+  max_total_trainings: 60
+  decider: rules
+
+record:
+  audit_path: outputs/audit_a3.jsonl
+  swanlab:
+    enabled: false
+    project: zhixun-harness-a3
+    mode: offline
+    public: true
+
+metrics:
+  worst_window: 2

@@ -1,0 +1,83 @@
+# A2 轴承退化识别（XJTU-SY）分类任务配置
+# 先运行 python3 scripts/extract_xjtu_features.py 生成特征缓存
+seed: 42
+
+task:
+  name: a2_xjtu
+  adapter: xjtu
+  type: classification
+  metric: macro_f1
+  n_classes: 3              # 0=Health 1=Degrading 2=Severe
+  critical_class: 2         # 严重退化：单独报告召回，漏报率 = 1 - 召回
+
+data:
+  cache: data/raw_xjtu/features.npz
+  stream_mode: condition    # condition(35Hz→37.5Hz→40Hz，每轴承一批) | within
+  single_condition: 0       # within 模式下使用的工况
+  severe_frac: 0.9          # 寿命分数 >= 该值为 Severe
+  fallback_fpt: 0.6         # 找不到退化变点时的回退起点
+  severe_after_fpt: true    # Severe 起点 = max(severe_frac, FPT)，避免突发失效轴承的标签噪声
+  fpt:
+    base_frac: 0.1
+    k_sigma: 3.0
+    consecutive: 3
+  standardize: true
+
+model:
+  backend: hist
+  params:
+    max_iter: 200
+    learning_rate: 0.1
+    max_depth: 8
+    min_samples_leaf: 10
+    l2_regularization: 1.0
+  calibrate: false
+  decay: 0.7
+
+budget:
+  enabled: true
+  small_n: 1200
+  min_iter: 200
+  floor_iter: 40
+  max_train_samples: 3000
+
+monitor:
+  psi_bins: 10
+  psi_threshold: 0.25
+  psi_feature_ratio: 0.15
+  ks_alpha: 0.05
+  pca_components: 8
+  pca_threshold: 2.0
+  perf_drop: 0.03
+  label_shift_threshold: 0.2
+  error_detector: adwin
+
+gate:
+  val_frac: 0.3
+  val_mode: in_batch
+  min_gain: 0.005
+  critical_recall_tol: 0.05  # Severe 类召回相对在线模型的最大允许退化（严重退化漏报约束）
+  forget_tol: 0.02
+  replay_per_batch: 60
+  replay_capacity: 600
+  max_consecutive_failures: 3
+
+loop:
+  min_batch_size: 30        # 最短寿命轴承 2_4 仅 42 条
+  min_window_samples: 300
+  max_candidates: 2
+  max_trainings_per_batch: 3
+  train_timeout_s: 60
+  max_total_trainings: 60
+  decider: rules
+
+record:
+  audit_path: outputs/audit_a2.jsonl
+  swanlab:
+    enabled: false
+    project: zhixun-harness-a2
+    mode: offline
+    public: true
+
+metrics:
+  worst_window: 2

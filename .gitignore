@@ -1,0 +1,33 @@
+# === Secrets (NEVER commit) ===
+.env
+.env.*
+*.key
+*.pem
+
+# === Model weights / official datasets (do not redistribute) ===
+base/
+data/
+backup/
+
+# === Build / run artifacts ===
+outputs/
+*.tar
+*.tar.gz
+*.zip
+
+# === Third-party / official SDK (reference separately, not our source) ===
+third_party/
+contest-harness-sdk-1.0.2/
+
+# === Python caches / venvs ===
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# === OS / editor ===
+.DS_Store
+*.swp

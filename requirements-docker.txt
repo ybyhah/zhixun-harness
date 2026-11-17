@@ -1,0 +1,8 @@
+# 镜像内最小依赖（只覆盖官方评分路径）
+# 实测：官方包 baselines/requirements.txt 只要 numpy；
+# 我们的 src/driver/ + scripts/run_official.py 的第三方依赖也只有 numpy，其余全是标准库。
+# pandas / scikit-learn / scipy / matplotlib / frouros 仅"自研对照闭环"(src/harness/)需要，
+# 不在评分路径上，因此不进镜像——既压体积，也降低离线环境的装包风险。
+
+numpy==1.26.4        # 与官方包锁定版本一致
+swanlab>=0.10        # 实验记录（offline 模式亦需此库；默认 SWANLAB=0 不启用）
