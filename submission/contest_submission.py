@@ -170,9 +170,23 @@ def _avoid_repeat(parent_artifact_id, epochs, lr, history):
 
 def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                             parent_artifact_id):
-    del history, parent_artifact_id
-    if str(dataset_key).upper() == "A" and round_index in (1, 2):
+    profile = str(dataset_key).upper()
+    if profile == "A" and round_index in (1, 2):
         return 10, 0.01, "A_early_round:前两轮采用已验证的强起点"
+    if profile == "B":
+        configs = [record.get("configuration") for record in history
+                   if isinstance(record, dict)]
+        matching = [config for config in configs if isinstance(config, dict)
+                    and config.get("parent_artifact_id") == parent_artifact_id]
+        if matching:
+            decision = matching[-1].get("platform_decision")
+            reason = decision.get("reason") if isinstance(decision, dict) else None
+            if reason not in ("candidate_better", "first_round_valid_candidate"):
+                tried = {(config.get("epochs"), config.get("learning_rate"))
+                         for config in matching}
+                for candidate in ((5, 0.001), (3, 0.0005), (8, 0.0003)):
+                    if candidate not in tried:
+                        return (*candidate, "B_stagnation_switch:上一轮无改善后换轴")
     return epochs, lr, ""
 
 

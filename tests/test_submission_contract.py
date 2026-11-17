@@ -153,6 +153,32 @@ def test_a_third_round_keeps_qwen_proposal():
         "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, "")
 
 
+def test_b_stagnation_switches_to_first_untried_axis():
+    history = [{
+        "configuration": {
+            "parent_artifact_id": "parent-b", "epochs": 5,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "candidate_not_better"},
+        }
+    }]
+    epochs, lr, reason = cs._apply_profile_strategy(
+        "B", 4, 10, 0.002, history, "parent-b")
+    assert (epochs, lr) == (3, 0.0005)
+    assert "B_stagnation_switch" in reason
+
+
+def test_b_improving_previous_round_keeps_qwen_proposal():
+    history = [{
+        "configuration": {
+            "parent_artifact_id": "old-parent", "epochs": 5,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "candidate_better"},
+        }
+    }]
+    assert cs._apply_profile_strategy(
+        "B", 4, 7, 0.002, history, "parent-b") == (7, 0.002, "")
+
+
 class _Parent:
     artifact_id = "parent-1"
     receipt = {"artifact_id": "parent-1"}
