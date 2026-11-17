@@ -179,6 +179,36 @@ def test_b_improving_previous_round_keeps_qwen_proposal():
         "B", 4, 7, 0.002, history, "parent-b") == (7, 0.002, "")
 
 
+def test_best_history_artifact_requires_platform_allowlist():
+    history = [{
+        "id": "r1", "selected_artifact_id": "history-best",
+        "summary": {"metrics": {"rmse": 8.0}},
+    }]
+    choice = cs._best_allowed_history(
+        history, [{"artifact_id": "history-best"}], "rmse", "lower",
+        {"rmse": 10.0}, dataset_key="B")
+    assert choice == {
+        "artifact_id": "history-best", "history_id": "r1",
+        "metrics": {"rmse": 8.0},
+    }
+    assert cs._best_allowed_history(
+        history, [{"artifact_id": "other"}], "rmse", "lower",
+        {"rmse": 10.0}, dataset_key="B") is None
+
+
+def test_c_history_artifact_with_worse_nasa_is_not_restored():
+    history = [{
+        "id": "r1", "selected_artifact_id": "unsafe-history",
+        "summary": {"metrics": {
+            "rmse": 8.0, "nasa_asymmetric_score": 110.0,
+        }},
+    }]
+    assert cs._best_allowed_history(
+        history, [{"artifact_id": "unsafe-history"}], "rmse", "lower",
+        {"rmse": 10.0, "nasa_asymmetric_score": 100.0},
+        dataset_key="C") is None
+
+
 class _Parent:
     artifact_id = "parent-1"
     receipt = {"artifact_id": "parent-1"}
@@ -195,7 +225,7 @@ class _Data:
 
 
 class _Round:
-    def __init__(self, history, summary, round_index=2):
+    def __init__(self, history, summary, round_index=2, artifacts=None):
         self.dataset_key = "A"
         self.round_index = round_index
         self.max_output_tokens = 512
@@ -206,6 +236,7 @@ class _Round:
         self.call_ids = []
         self._history = history
         self._summary = summary
+        self.artifacts = artifacts or []
         self.finished = None
 
     def history(self):
@@ -269,6 +300,30 @@ def test_train_promotes_platform_improvement_even_if_local_gate_rejects(monkeypa
     cs.train(rnd)
     assert rnd.finished["selected_artifact_id"] == "candidate-1"
     assert rnd.finished["configuration"]["local_diagnostic"] == {"p": 1.0}
+
+
+def test_train_can_restore_allowed_platform_history_best(monkeypatch, tmp_path):
+    history = [
+        {
+            "id": "r1", "selected_artifact_id": "history-best",
+            "summary": {"metrics": {"macro_f1": 0.85}},
+            "configuration": {"epochs": 5, "learning_rate": 0.001},
+        },
+        {
+            "id": "r2", "selected_artifact_id": "parent-1",
+            "summary": {"metrics": {"macro_f1": 0.80}},
+            "configuration": {"epochs": 5, "learning_rate": 0.001},
+        },
+    ]
+    rnd = _Round(
+        history, {"macro_f1": 0.81}, round_index=3,
+        artifacts=[{"artifact_id": "history-best"}, {"artifact_id": "parent-1"}],
+    )
+    _fake_training(monkeypatch, tmp_path, local_promote=True)
+    cs.train(rnd)
+    assert rnd.finished["selected_artifact_id"] == "history-best"
+    assert rnd.finished["configuration"]["selected_source"] == "history"
+    assert rnd.finished["configuration"]["selected_history_id"] == "r1"
 
 
 def test_formal_dockerfile_and_runbook_use_sdk_submission_image():

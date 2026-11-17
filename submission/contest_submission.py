@@ -145,6 +145,36 @@ def _parent_metrics(rnd, history):
     return {}
 
 
+def _best_allowed_history(history, artifacts, metric, direction, parent_metrics,
+                          dataset_key=None):
+    allowed = {item.get("artifact_id") for item in artifacts
+               if isinstance(item, dict) and isinstance(item.get("artifact_id"), str)}
+    best = None
+    for record in history:
+        if not isinstance(record, dict):
+            continue
+        artifact_id = record.get("selected_artifact_id")
+        if artifact_id not in allowed:
+            continue
+        metrics = _history_metrics(record)
+        eligible, _ = _select_from_platform(
+            task="", metric=metric, direction=direction,
+            candidate=metrics, parent=parent_metrics, first_round=False,
+            dataset_key=dataset_key)
+        if not eligible:
+            continue
+        if best is not None:
+            better, _ = _select_from_platform(
+                task="", metric=metric, direction=direction,
+                candidate=metrics, parent=best["metrics"], first_round=False,
+                dataset_key=dataset_key)
+            if not better:
+                continue
+        best = {"artifact_id": artifact_id, "history_id": record.get("id"),
+                "metrics": metrics}
+    return best
+
+
 def _avoid_repeat(parent_artifact_id, epochs, lr, history):
     if lr is None:
         return epochs, lr
@@ -335,16 +365,35 @@ def train(rnd):
         task=task, metric=metric, direction=direction,
         candidate=candidate_metrics, parent=parent_metrics,
         first_round=rnd.round_index == 1, dataset_key=rnd.dataset_key)
+    if promote:
+        selected, selected_metrics = submitted["artifact_id"], candidate_metrics
+        verdict, selected_source = "采纳候选", "candidate"
+    else:
+        selected, selected_metrics = rnd.parent.artifact_id, parent_metrics
+        verdict, selected_source = "保留父模型", "parent"
+    selected_history_id = None
+    history_best = _best_allowed_history(
+        history, getattr(rnd, "artifacts", []), metric, direction,
+        parent_metrics, dataset_key=rnd.dataset_key)
+    if history_best is not None:
+        restore, _ = _select_from_platform(
+            task=task, metric=metric, direction=direction,
+            candidate=history_best["metrics"], parent=selected_metrics,
+            first_round=False, dataset_key=rnd.dataset_key)
+        if restore:
+            selected = history_best["artifact_id"]
+            selected_metrics = history_best["metrics"]
+            selected_history_id = history_best["history_id"]
+            verdict, selected_source = "恢复历史最佳产物", "history"
     finish_configuration = {
         **configuration,
         "platform_metrics": candidate_metrics,
         "parent_platform_metrics": parent_metrics,
         "platform_decision": platform_decision,
+        "selected_source": selected_source,
+        "selected_history_id": selected_history_id,
+        "selected_platform_metrics": selected_metrics,
     }
-    if promote:
-        selected, verdict = submitted["artifact_id"], "采纳候选"
-    else:
-        selected, verdict = rnd.parent.artifact_id, "保留父模型"
     reason = (f"平台摘要判定：{verdict}。模型建议调用 {call_id}；"
               f"平台候选指标={json.dumps(candidate_metrics, ensure_ascii=False)}；"
               f"平台父模型指标={json.dumps(parent_metrics, ensure_ascii=False)}；"
