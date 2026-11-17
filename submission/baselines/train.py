@@ -1,5 +1,6 @@
 """Train or continue a CPU baseline from public train/validation JSONL only."""
 import argparse
+import copy
 from datetime import datetime, timezone
 import json
 import os
@@ -17,6 +18,15 @@ except ImportError:
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _better_validation(task, current, best):
+    key = "macro_f1" if task == "classification" else "rmse"
+    value = current.get(key)
+    previous = best.get(key) if best else None
+    if not isinstance(value, (int, float)) or not np.isfinite(value):
+        return False
+    return previous is None or (value > previous if task == "classification" else value < previous)
 
 
 def metrics(model, data):
@@ -96,13 +106,19 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
     validation_before = metrics(model, validation)
     started = time.monotonic()
     records = []
+    best_model, best_validation = None, None
     for _ in range(count):
         loss = model.fit(train["x"], train["y"], 1)[0]
+        current_validation = metrics(model, validation)
         records.append({"epoch": model.meta["epochs"], "step": model.meta["steps"], "loss": loss,
-                        "validation": metrics(model, validation)})
+                        "validation": current_validation})
+        if _better_validation(config["task"], current_validation, best_validation):
+            best_model, best_validation = copy.deepcopy(model), current_validation
     duration = time.monotonic() - started
-    if not records:
-        raise ValueError("at least one training epoch is required")
+    if best_model is None:
+        raise ValueError("training produced no finite validation metric")
+    trained_final_epochs = model.meta["epochs"]
+    model = best_model
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".baseline-", dir=output.parent) as temporary:
         staging = Path(temporary) / "result"
@@ -118,8 +134,10 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
                   "profile_sha256": sha256(config_raw), "parent_checkpoint_sha256": parent,
                   "checkpoint_sha256": checkpoint_digest(checkpoint), "initial_steps": initial_steps,
                   "initial_epochs": initial_epochs, "final_steps": model.meta["steps"], "final_epochs": model.meta["epochs"],
+                  "trained_final_epochs": trained_final_epochs, "selected_epoch": model.meta["epochs"],
                   "training_seconds": duration, "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
-                  "validation_before": validation_before, "validation_after": records[-1]["validation"],
+                  "validation_before": validation_before, "validation_after": best_validation,
+                  "best_validation": best_validation,
                   "configuration": {"hidden": model.meta["hidden"], "activation": "tanh", "optimizer": "Adam",
                       "adam_beta1": .9, "adam_beta2": .999, "adam_epsilon": 1e-8, "gradient_clip_norm": 5.0,
                       "feature_clip": [-10.0, 10.0], "normalization": "initial_training_mean_std",
