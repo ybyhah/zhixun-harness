@@ -22,6 +22,10 @@ python3 /app/harness.py predict
 
 模型只通过 SDK 的 `rnd.model()` 调用，PyTRiO 密钥由平台持有。公开训练/验证投影、父产物和工作目录分别由平台挂载到 `/data`、`/previous` 和 `/workspace`，不使用下面的本地 `base/` 挂载命令。
 
+正式链路会保存本轮验证最优 epoch；A 前两轮使用固定强起点，B 在一轮无改善后自动换轴，
+C 使用寿命高估惩罚并同时检查平台 NASA 指标。最终产物只从当前候选、父模型和平台授权的
+历史 artifact 中按平台 `summary.metrics` 选择。
+
 本地只验证 `describe`：
 
 ```bash
