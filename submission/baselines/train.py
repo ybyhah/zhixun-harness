@@ -18,14 +18,27 @@ except ImportError:
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
+C_NASA_TOLERANCE = 0.05
+C_RMSE_TOLERANCE = 0.01
+C_EARLY_STOP_PATIENCE = 3
 
 
-def _better_validation(task, current, best):
+def _better_validation(profile, task, current, best):
     key = "macro_f1" if task == "classification" else "rmse"
     value = current.get(key)
     previous = best.get(key) if best else None
     if not isinstance(value, (int, float)) or not np.isfinite(value):
         return False
+    if profile == "C" and task == "regression" and best:
+        nasa = current.get("nasa_asymmetric_score")
+        previous_nasa = best.get("nasa_asymmetric_score")
+        if not all(isinstance(item, (int, float)) and np.isfinite(item)
+                   for item in (nasa, previous_nasa)):
+            return False
+        rmse_improved = value < previous and nasa <= previous_nasa * (1 + C_NASA_TOLERANCE)
+        nasa_improved = (nasa < previous_nasa * (1 - C_NASA_TOLERANCE)
+                         and value <= previous * (1 + C_RMSE_TOLERANCE))
+        return rmse_improved or nasa_improved
     return previous is None or (value > previous if task == "classification" else value < previous)
 
 
@@ -105,7 +118,7 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
     if bearing_rul:
         model.meta["target_unit"] = "minutes"
     if config["profile"] == "C" and config["task"] == "regression":
-        model.meta["overestimate_weight"] = 1.5
+        model.meta["overestimate_weight"] = 1.0
     if learning_rate is not None:
         model.meta["learning_rate"] = learning_rate
     if batch_size is not None:
@@ -118,14 +131,21 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
     validation_before = metrics(model, validation)
     started = time.monotonic()
     records = []
-    best_model, best_validation = None, None
+    best_model, best_validation, stale_epochs = None, None, 0
     for _ in range(count):
         loss = model.fit(train["x"], train["y"], 1)[0]
         current_validation = metrics(model, validation)
         records.append({"epoch": model.meta["epochs"], "step": model.meta["steps"], "loss": loss,
                         "validation": current_validation})
-        if _better_validation(config["task"], current_validation, best_validation):
+        if _better_validation(config["profile"], config["task"],
+                              current_validation, best_validation):
             best_model, best_validation = copy.deepcopy(model), current_validation
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+            if (config["profile"] == "C"
+                    and stale_epochs >= C_EARLY_STOP_PATIENCE):
+                break
     duration = time.monotonic() - started
     if best_model is None:
         raise ValueError("training produced no finite validation metric")
@@ -146,7 +166,8 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
                   "profile_sha256": sha256(config_raw), "parent_checkpoint_sha256": parent,
                   "checkpoint_sha256": checkpoint_digest(checkpoint), "initial_steps": initial_steps,
                   "initial_epochs": initial_epochs, "final_steps": model.meta["steps"], "final_epochs": model.meta["epochs"],
-                  "trained_final_epochs": trained_final_epochs, "selected_epoch": model.meta["epochs"],
+                   "trained_final_epochs": trained_final_epochs, "selected_epoch": model.meta["epochs"],
+                   "early_stopped": trained_final_epochs - initial_epochs < count,
                   "training_seconds": duration, "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
                   "validation_before": validation_before, "validation_after": best_validation,
                   "best_validation": best_validation,

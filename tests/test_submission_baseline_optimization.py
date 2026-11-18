@@ -112,7 +112,79 @@ def test_nasa_score_penalizes_equal_overestimate_more_than_underestimate():
     assert over > under > 0
 
 
-def test_c_train_run_persists_safety_weight_and_nasa_metric(tmp_path):
+def test_c_epoch_selection_balances_rmse_and_nasa():
+    best = {"rmse": 10.0, "nasa_asymmetric_score": 100.0}
+    assert baseline_train._better_validation(
+        "C", "regression", {"rmse": 9.9, "nasa_asymmetric_score": 104.0}, best)
+    assert not baseline_train._better_validation(
+        "C", "regression", {"rmse": 9.8, "nasa_asymmetric_score": 106.0}, best)
+    assert baseline_train._better_validation(
+        "C", "regression", {"rmse": 10.1, "nasa_asymmetric_score": 94.0}, best)
+
+
+def test_c_stops_after_three_epochs_without_multiobjective_improvement(
+        monkeypatch, tmp_path):
+    class FakeModel:
+        def __init__(self, task, paths, classes, x, y, *, hidden, seed,
+                     learning_rate, batch_size):
+            del x, y
+            self.meta = {
+                "task": task, "paths": paths, "classes": classes,
+                "hidden": hidden, "seed": seed, "epochs": 0, "steps": 0,
+                "learning_rate": learning_rate, "batch_size": batch_size,
+                "parameter_count": 1,
+            }
+
+        @classmethod
+        def load(cls, path):
+            raise AssertionError(f"unexpected resume: {path}")
+
+        def validate(self):
+            return None
+
+        def fit(self, x, y, epochs):
+            del x, y
+            self.meta["epochs"] += epochs
+            self.meta["steps"] += epochs
+            return [1.0]
+
+        def save(self, path):
+            Path(path).write_text(f"epoch={self.meta['epochs']}", encoding="utf-8")
+
+    def fake_dataset(path, task, classes, expected_paths=None):
+        del task, classes, expected_paths
+        return {
+            "ids": ["v1"] if "validation" in str(path) else ["t1"],
+            "x": np.array([[1.0]]), "y": np.array([1.0]),
+            "paths": ['[["key","x"]]'], "sha256": "sha256:data",
+        }
+
+    values = {
+        0: {"mae": 11.0, "rmse": 11.0, "nasa_asymmetric_score": 110.0},
+        1: {"mae": 9.0, "rmse": 9.0, "nasa_asymmetric_score": 90.0},
+        2: {"mae": 9.1, "rmse": 9.1, "nasa_asymmetric_score": 91.0},
+        3: {"mae": 9.2, "rmse": 9.2, "nasa_asymmetric_score": 92.0},
+        4: {"mae": 9.3, "rmse": 9.3, "nasa_asymmetric_score": 93.0},
+    }
+    monkeypatch.setattr(baseline_train, "Model", FakeModel)
+    monkeypatch.setattr(baseline_train, "read_dataset", fake_dataset)
+    monkeypatch.setattr(
+        baseline_train, "metrics",
+        lambda model, data: values.get(model.meta["epochs"], values[4]))
+    monkeypatch.setattr(
+        baseline_train, "checkpoint_digest",
+        lambda path: "sha256:" + Path(path).read_text(encoding="utf-8"))
+
+    output = tmp_path / "c-early-stop"
+    report = baseline_train.train_run(
+        "C", "train.jsonl", "validation.jsonl", output, epochs=10)
+
+    assert report["trained_final_epochs"] == 4
+    assert report["selected_epoch"] == 1
+    assert report["early_stopped"] is True
+
+
+def test_c_train_run_uses_official_weight_and_nasa_metric(tmp_path):
     train_path = tmp_path / "train.jsonl"
     validation_path = tmp_path / "validation.jsonl"
     train_rows = [
@@ -133,7 +205,7 @@ def test_c_train_run_persists_safety_weight_and_nasa_metric(tmp_path):
         "C", train_path, validation_path, output, epochs=1)
     saved = Model.load(output / "checkpoint.npz")
 
-    assert saved.meta["overestimate_weight"] == 1.5
-    assert report["configuration"]["overestimate_weight"] == 1.5
+    assert saved.meta["overestimate_weight"] == 1.0
+    assert report["configuration"]["overestimate_weight"] == 1.0
     assert report["best_validation"]["nasa_asymmetric_score"] >= 0
 
