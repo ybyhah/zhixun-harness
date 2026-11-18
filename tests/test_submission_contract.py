@@ -161,6 +161,24 @@ def test_history_prompt_contains_formal_platform_drift():
     assert "-0.05" in prompt
 
 
+def test_first_round_loop_evidence_is_complete_with_empty_history():
+    evidence = cs._loop_evidence(
+        [], ["call-1"], "首轮假设", "candidate_measured", "platform_summary")
+    assert evidence["history_read"] is True
+    assert evidence["history_ids"] == []
+    assert evidence["complete"] is True
+
+
+def test_complete_sdk_loop_count_uses_structured_formal_evidence():
+    history = [
+        {"configuration": {"loop_evidence": {"complete": True}}},
+        {"configuration": {"loop_evidence": {"complete": True}}},
+        {"configuration": {"loop_evidence": {"complete": True}}},
+        {"configuration": {"loop_evidence": {"complete": False}}},
+    ]
+    assert cs._complete_sdk_loop_count(history) == 3
+
+
 def test_parent_metrics_prefers_matching_parent_artifact():
     history = [
         {"id": "r1", "selected_artifact_id": "old", "summary": {"metrics": {"rmse": 11.0}}},
@@ -357,6 +375,31 @@ def test_train_promotes_platform_improvement_even_if_local_gate_rejects(monkeypa
     cs.train(rnd)
     assert rnd.finished["selected_artifact_id"] == "candidate-1"
     assert rnd.finished["configuration"]["local_diagnostic"] == {"p": 1.0}
+    assert rnd.finished["configuration"]["loop_evidence"]["complete"] is True
+    assert (rnd.finished["configuration"]["loop_evidence"]["experiment_status"]
+            == "candidate_measured")
+    assert rnd.finished["configuration"]["platform_drift"]["enabled"] is True
+
+
+def test_train_failure_records_complete_formal_loop(monkeypatch, tmp_path):
+    history = [{
+        "id": "r1", "selected_artifact_id": "parent-1",
+        "summary": {"metrics": {"macro_f1": 0.80}},
+        "configuration": {"epochs": 5, "learning_rate": 0.001},
+    }]
+    rnd = _Round(history, {"macro_f1": 0.81})
+    monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
+    monkeypatch.setattr(
+        cs.subprocess, "run",
+        lambda *args, **kwargs: type(
+            "Proc", (), {"returncode": 1, "stderr": "training failed"})(),
+    )
+    cs.train(rnd)
+    evidence = rnd.finished["configuration"]["loop_evidence"]
+    assert evidence["complete"] is True
+    assert evidence["experiment_status"] == "train_failed"
+    assert evidence["decision_source"] == "failure_fallback"
+    assert rnd.finished["configuration"]["platform_drift"]["status"] == "UNKNOWN"
 
 
 def test_train_can_restore_allowed_platform_history_best(monkeypatch, tmp_path):

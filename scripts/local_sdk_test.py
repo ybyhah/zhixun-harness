@@ -119,6 +119,9 @@ def _run_train(decide_hook, *, summary=None, history=None, round_index=1):
 def test_train_promote():
     rnd, ckpt, _ = _run_train(lambda *a, **k: (True, {"p_better": 1.0}))
     assert rnd.finished["selected_artifact_id"] == "artifact-local-1", "晋升应选候选"
+    config = rnd.finished["configuration"]
+    assert config["loop_evidence"]["complete"] is True
+    assert config["platform_drift"]["enabled"] is True
     print("[train/promote] ok: 选中候选，model_call_ids=", rnd.finished["model_call_ids"])
     return ckpt
 
@@ -148,6 +151,8 @@ def test_train_fail_keep_parent():
     assert rnd.submitted is None, "训练失败不应提交候选"
     assert rnd.finished and rnd.finished["selected_artifact_id"] == "parent-artifact-0"
     assert "train_failed" in rnd.finished["configuration"]
+    assert rnd.finished["configuration"]["loop_evidence"]["complete"] is True
+    assert rnd.finished["configuration"]["platform_drift"]["status"] == "UNKNOWN"
     print("[train/fail] ok: 续训失败→保留父模型，model_call_ids=", rnd.finished["model_call_ids"])
 
 

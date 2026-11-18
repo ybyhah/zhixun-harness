@@ -156,6 +156,36 @@ def _history_prompt(history):
     return "\n".join(lines) if lines else "  （暂无历史）"
 
 
+def _loop_evidence(history, model_call_ids, hypothesis, experiment_status,
+                   decision_source):
+    history_ids = [record["id"] for record in history
+                   if isinstance(record, dict) and isinstance(record.get("id"), str)]
+    calls = [call_id for call_id in model_call_ids
+             if isinstance(call_id, str) and call_id]
+    hypothesis_recorded = isinstance(hypothesis, str) and bool(hypothesis.strip())
+    experiment_done = experiment_status in {"candidate_measured", "train_failed"}
+    decision_done = decision_source in {"platform_summary", "failure_fallback"}
+    return {
+        "history_read": True,
+        "history_ids": history_ids,
+        "model_call_ids": calls,
+        "hypothesis_recorded": hypothesis_recorded,
+        "experiment_status": experiment_status,
+        "decision_source": decision_source,
+        "complete": bool(calls and hypothesis_recorded and experiment_done and decision_done),
+    }
+
+
+def _complete_sdk_loop_count(history):
+    count = 0
+    for record in history:
+        config = record.get("configuration") if isinstance(record, dict) else None
+        evidence = config.get("loop_evidence") if isinstance(config, dict) else None
+        if isinstance(evidence, dict) and evidence.get("complete") is True:
+            count += 1
+    return count
+
+
 def _parent_metrics(rnd, history):
     receipt = getattr(getattr(rnd, "parent", None), "receipt", {})
     metrics = _summary_metrics(receipt)
@@ -366,6 +396,11 @@ def train(rnd):
     if proc.returncode != 0:
         # 续训失败不让整轮失败（C1 无人干预跑完）：优雅保留父模型并正常结束本轮。
         err = (proc.stderr.strip().splitlines() or ["非零退出"])[-1][:500]
+        parent_metrics = _parent_metrics(rnd, history)
+        drift = _platform_metric_drift(
+            metric, direction, {}, parent_metrics, dataset_key=rnd.dataset_key)
+        loop_evidence = _loop_evidence(
+            history, rnd.call_ids, hypothesis, "train_failed", "failure_fallback")
         rnd.finish(
             selected_artifact_id=rnd.parent.artifact_id,
             hypothesis=hypothesis,
@@ -373,7 +408,14 @@ def train(rnd):
             reason=f"官方续训失败：{err}；为保证无人干预跑完，保留父模型。模型调用 {call_id}。",
             configuration={"epochs": epochs, "learning_rate": lr,
                            "parent_artifact_id": rnd.parent.artifact_id,
-                           "model_call_id": call_id, "train_failed": err},
+                           "model_call_id": call_id, "train_failed": err,
+                           "platform_metrics": {},
+                           "parent_platform_metrics": parent_metrics,
+                           "platform_drift": drift,
+                           "loop_evidence": loop_evidence,
+                           "complete_loops_total": (
+                               _complete_sdk_loop_count(history)
+                               + int(loop_evidence["complete"]))},
             seed=42, history_ids=[h["id"] for h in history],
             model_call_ids=list(rnd.call_ids))
         return
@@ -396,6 +438,9 @@ def train(rnd):
 
     candidate_metrics = _summary_metrics({"summary": submitted.get("summary")})
     parent_metrics = _parent_metrics(rnd, history)
+    platform_drift = _platform_metric_drift(
+        metric, direction, candidate_metrics, parent_metrics,
+        dataset_key=rnd.dataset_key)
     promote, platform_decision = _select_from_platform(
         task=task, metric=metric, direction=direction,
         candidate=candidate_metrics, parent=parent_metrics,
@@ -428,11 +473,18 @@ def train(rnd):
         "selected_source": selected_source,
         "selected_history_id": selected_history_id,
         "selected_platform_metrics": selected_metrics,
+        "platform_drift": platform_drift,
     }
+    loop_evidence = _loop_evidence(
+        history, rnd.call_ids, hypothesis, "candidate_measured", "platform_summary")
+    finish_configuration["loop_evidence"] = loop_evidence
+    finish_configuration["complete_loops_total"] = (
+        _complete_sdk_loop_count(history) + int(loop_evidence["complete"]))
     reason = (f"平台摘要判定：{verdict}。模型建议调用 {call_id}；"
               f"平台候选指标={json.dumps(candidate_metrics, ensure_ascii=False)}；"
               f"平台父模型指标={json.dumps(parent_metrics, ensure_ascii=False)}；"
-              f"判定={json.dumps(platform_decision, ensure_ascii=False)}"[:3900])
+              f"判定={json.dumps(platform_decision, ensure_ascii=False)}；"
+              f"漂移={json.dumps(platform_drift, ensure_ascii=False)}"[:3900])
     rnd.finish(
         selected_artifact_id=selected,
         hypothesis=hypothesis, change_summary=change,
