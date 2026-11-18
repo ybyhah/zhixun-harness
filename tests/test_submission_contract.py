@@ -262,15 +262,16 @@ def test_avoid_repeat_changes_duplicate_configuration():
 
 @pytest.mark.parametrize("round_index", [1, 2])
 def test_a_early_round_strategy_uses_strong_known_start(round_index):
-    epochs, lr, reason = cs._apply_profile_strategy(
+    epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
         "A", round_index, 3, 0.0005, [], "parent-a")
     assert (epochs, lr) == (10, 0.01)
+    assert reset_optimizer is False
     assert "A_early_round" in reason
 
 
 def test_a_third_round_keeps_qwen_proposal():
     assert cs._apply_profile_strategy(
-        "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, "")
+        "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, False, "")
 
 
 def test_b_stagnation_switches_to_first_untried_axis():
@@ -281,9 +282,10 @@ def test_b_stagnation_switches_to_first_untried_axis():
             "platform_decision": {"reason": "candidate_not_better"},
         }
     }]
-    epochs, lr, reason = cs._apply_profile_strategy(
+    epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
         "B", 4, 10, 0.002, history, "parent-b")
     assert (epochs, lr) == (3, 0.0005)
+    assert reset_optimizer is True
     assert "B_stagnation_switch" in reason
 
 
@@ -296,7 +298,7 @@ def test_b_improving_previous_round_keeps_qwen_proposal():
         }
     }]
     assert cs._apply_profile_strategy(
-        "B", 4, 7, 0.002, history, "parent-b") == (7, 0.002, "")
+        "B", 4, 7, 0.002, history, "parent-b") == (7, 0.002, False, "")
 
 
 def test_best_history_artifact_requires_platform_allowlist():

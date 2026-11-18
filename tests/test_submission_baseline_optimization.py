@@ -106,6 +106,23 @@ def test_c_weight_changes_training_loss_without_affecting_b_default():
     assert c_loss == 1.5 * b_loss
 
 
+def test_reset_optimizer_moments_preserves_steps_and_parameters():
+    x = np.array([[0.0], [1.0]])
+    y = np.array([0.0, 1.0])
+    model = Model("regression", ["x"], [], x, y, hidden=1, seed=42)
+    model.meta["steps"] = 9
+    before = {name: value.copy() for name, value in model.params.items()}
+    for value in (*model.first.values(), *model.second.values()):
+        value.fill(2.0)
+
+    baseline_train._reset_optimizer_moments(model)
+
+    assert model.meta["steps"] == 9
+    assert all(np.array_equal(model.params[name], before[name]) for name in before)
+    assert all(not np.any(value) for value in model.first.values())
+    assert all(not np.any(value) for value in model.second.values())
+
+
 def test_nasa_score_penalizes_equal_overestimate_more_than_underestimate():
     over = baseline_train._nasa_score(np.array([11.0]), np.array([1.0]))
     under = baseline_train._nasa_score(np.array([0.0]), np.array([10.0]))

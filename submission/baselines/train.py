@@ -48,6 +48,11 @@ def _nasa_score(predicted, expected):
     return float(np.sum(np.expm1(np.minimum(exponent, 600.0))))
 
 
+def _reset_optimizer_moments(model):
+    for value in (*model.first.values(), *model.second.values()):
+        value.fill(0.0)
+
+
 def metrics(model, data):
     predicted = model.predict(data["x"])
     expected = data["y"]
@@ -71,7 +76,8 @@ def metrics(model, data):
 
 
 def train_run(profile, train_path, validation_path, output, *, resume=None, epochs=None,
-              learning_rate=None, batch_size=None, seed=None, stage_id="baseline", label_provenance=None):
+              learning_rate=None, batch_size=None, seed=None, stage_id="baseline",
+              label_provenance=None, reset_optimizer_moments=False):
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise ValueError("output must be a new directory; previous rounds are never overwritten")
@@ -114,6 +120,10 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
         raise ValueError("resume hidden width must match checkpoint; changing the profile does not migrate weights")
     if resume and config["seed"] != model.meta["seed"]:
         raise ValueError("resume profile must preserve the checkpoint's random seed")
+    if reset_optimizer_moments:
+        if config["profile"] != "B":
+            raise ValueError("optimizer moment reset is only supported for B")
+        _reset_optimizer_moments(model)
     model.meta["profile"] = config["profile"]
     if bearing_rul:
         model.meta["target_unit"] = "minutes"
@@ -176,7 +186,8 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
                       "feature_clip": [-10.0, 10.0], "normalization": "initial_training_mean_std",
                       "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
                       "requested_epochs": count, "classes": model.meta["classes"],
-                      "overestimate_weight": model.meta.get("overestimate_weight", 1.0)},
+                       "overestimate_weight": model.meta.get("overestimate_weight", 1.0),
+                       "optimizer_moments_reset": bool(reset_optimizer_moments)},
                   "source_sha256": {name: sha256((ROOT / name).read_bytes()) for name in ("model.py", "data.py", "train.py", "predict.py")},
                   "label_provenance": provenance, "created_at": datetime.now(timezone.utc).isoformat()}
         if bearing_rul:
@@ -205,12 +216,14 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--stage-id", default="baseline")
     parser.add_argument("--label-provenance", help="Required only for historical B classification profiles: JSON with status and method")
+    parser.add_argument("--reset-optimizer-moments", action="store_true")
     args = parser.parse_args()
     if args.epochs is not None and not 1 <= args.epochs <= 10000:
         parser.error("epochs must be in 1..10000")
     report = train_run(args.profile, args.train, args.validation, args.output, resume=args.resume or args.from_baseline,
         epochs=args.epochs, learning_rate=args.learning_rate, batch_size=args.batch_size, seed=args.seed,
-        stage_id=args.stage_id, label_provenance=args.label_provenance)
+        stage_id=args.stage_id, label_provenance=args.label_provenance,
+        reset_optimizer_moments=args.reset_optimizer_moments)
     print(json.dumps(report, ensure_ascii=False, allow_nan=False))
 
 

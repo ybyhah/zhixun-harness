@@ -283,7 +283,7 @@ def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                             parent_artifact_id):
     profile = str(dataset_key).upper()
     if profile == "A" and round_index in (1, 2):
-        return 10, 0.01, "A_early_round:前两轮采用已验证的强起点"
+        return 10, 0.01, False, "A_early_round:前两轮采用已验证的强起点"
     if profile == "B":
         configs = [record.get("configuration") for record in history
                    if isinstance(record, dict)]
@@ -297,8 +297,9 @@ def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                          for config in matching}
                 for candidate in ((5, 0.001), (3, 0.0005), (8, 0.0003)):
                     if candidate not in tried:
-                        return (*candidate, "B_stagnation_switch:上一轮无改善后换轴")
-    return epochs, lr, ""
+                        return (*candidate, True,
+                                "B_stagnation_switch:上一轮无改善后换轴并重置Adam动量")
+    return epochs, lr, False, ""
 
 
 def predict(sample, model_dir):
@@ -317,7 +318,7 @@ def predict(sample, model_dir):
 
 
 def _ask_model(rnd, task, metric, history):
-    """调用一次模型，让它读历史提下一轮续训超参。返回 (epochs, lr, hypothesis, call_id)。
+    """调用一次模型，让它读历史提下一轮续训超参和优化器动作。
 
     任何失败都回退官方默认超参，但模型调用已经发生（调用在前、解析在后），
     保证本轮必有一次真实 model_call。
@@ -348,12 +349,12 @@ def _ask_model(rnd, task, metric, history):
     if adjusted != (epochs, lr):
         epochs, lr = adjusted
         hypothesis += "；检测到同一父模型下重复配置，已确定性换轴"
-    epochs, lr, strategy_reason = _apply_profile_strategy(
+    epochs, lr, reset_optimizer, strategy_reason = _apply_profile_strategy(
         rnd.dataset_key, rnd.round_index, epochs, lr, history,
         rnd.parent.artifact_id)
     if strategy_reason:
         hypothesis += "；" + strategy_reason
-    return epochs, lr, hypothesis, receipt.call_id
+    return epochs, lr, reset_optimizer, hypothesis, receipt.call_id
 
 
 def _aggregate_better(task, before, after):
@@ -394,7 +395,8 @@ def train(rnd):
                              "higher" if task == "classification" else "lower")
     parent_ckpt = rnd.parent.path("checkpoint.npz")          # 摘要校验在 /previous 完成
     history = rnd.history()
-    epochs, lr, hypothesis, call_id = _ask_model(rnd, task, metric, history)
+    epochs, lr, reset_optimizer, hypothesis, call_id = _ask_model(
+        rnd, task, metric, history)
 
     work = Path(os.environ.get("CONTEST_WORK", "/workspace"))
     cand = work / "cand"                                      # train_run 要求新目录
@@ -406,6 +408,8 @@ def train(rnd):
            "--stage-id", f"round-{rnd.round_index}"]
     if lr is not None:
         cmd += ["--learning-rate", str(lr)]
+    if reset_optimizer:
+        cmd.append("--reset-optimizer-moments")
     env = {**os.environ, "PYTHONPATH": str(BASELINES_DIR.parent)}
     proc = subprocess.run(cmd, cwd=str(BASELINES_DIR.parent), env=env,
                           capture_output=True, text=True)
@@ -423,6 +427,7 @@ def train(rnd):
             change_summary=f"续训子进程失败，本轮保留父模型（{err}）"[:3900],
             reason=f"官方续训失败：{err}；为保证无人干预跑完，保留父模型。模型调用 {call_id}。",
             configuration={"epochs": epochs, "learning_rate": lr,
+                           "optimizer_moments_reset": reset_optimizer,
                            "parent_artifact_id": rnd.parent.artifact_id,
                            "model_call_id": call_id, "train_failed": err,
                            "platform_metrics": {},
@@ -444,6 +449,7 @@ def train(rnd):
     change = f"从父检查点续训 epochs={epochs} lr={lr if lr is not None else '默认'}"
     seed = int(report.get("seed", 42))
     configuration = {"epochs": epochs, "learning_rate": lr, "model_call_id": call_id,
+                     "optimizer_moments_reset": reset_optimizer,
                      "parent_artifact_id": rnd.parent.artifact_id,
                      "local_validation_after": after,
                      "local_diagnostic": local_diagnostic}
