@@ -23,7 +23,7 @@
 - Modify: `tests/test_submission_contract.py`
 - Test: `tests/test_submission_contract.py`
 
-- [ ] **Step 1: Replace the latest-three-only prompt test with default and C-all-history coverage**
+- [x] **Step 1: Replace the latest-three-only prompt test with default and C-all-history coverage**
 
 Keep the existing default assertion and add an explicit all-history assertion:
 
@@ -42,7 +42,7 @@ def test_history_prompt_defaults_to_latest_three_but_can_include_all_rounds():
     assert all(f"轮{i}:" in full_prompt for i in range(1, 6))
 ```
 
-- [ ] **Step 2: Add pure tests for C single-step, no-skip, and learning-rate de-duplication**
+- [x] **Step 2: Add pure tests for C single-step, no-skip, and learning-rate de-duplication**
 
 ```python
 def test_c_strategy_forces_one_epoch_and_keeps_qwen_learning_rate():
@@ -76,7 +76,7 @@ def test_c_avoid_repeat_compares_learning_rate_after_epoch_is_fixed():
     assert learning_rate == pytest.approx(0.0005)
 ```
 
-- [ ] **Step 3: Add an integration test proving C trains instead of skipping and passes `--epochs 1`**
+- [x] **Step 3: Add an integration test proving C trains instead of skipping and passes `--epochs 1`**
 
 ```python
 def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
@@ -119,7 +119,7 @@ def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
     assert rnd.finished["configuration"].get("resource_action") is None
 ```
 
-- [ ] **Step 4: Run the new tests and confirm failure**
+- [x] **Step 4: Run the new tests and confirm failure**
 
 Run:
 
@@ -135,7 +135,7 @@ Expected: failures because the helpers do not accept `include_all`/`dataset_key`
 - Modify: `submission/contest_submission.py`
 - Test: `tests/test_submission_contract.py`
 
-- [ ] **Step 1: Let `_history_prompt` optionally retain all history**
+- [x] **Step 1: Let `_history_prompt` optionally retain all history**
 
 Change the signature and iteration only:
 
@@ -147,7 +147,7 @@ def _history_prompt(history, include_all=False):
         # existing formatting remains unchanged
 ```
 
-- [ ] **Step 2: Exempt C from `_should_skip_training` without changing A/B**
+- [x] **Step 2: Exempt C from `_should_skip_training` without changing A/B**
 
 Change the signature and add the early return:
 
@@ -165,7 +165,7 @@ if _should_skip_training(history, rnd.parent.artifact_id,
                          dataset_key=rnd.dataset_key):
 ```
 
-- [ ] **Step 3: Make C de-duplicate learning rates independently of proposed epochs**
+- [x] **Step 3: Make C de-duplicate learning rates independently of proposed epochs**
 
 Extend `_avoid_repeat` with `dataset_key=None`. For C, normalize the candidate epoch to 1, compare tried configurations by learning rate under the same parent, and choose the first unused bounded multiplier:
 
@@ -205,7 +205,7 @@ def _avoid_repeat(parent_artifact_id, epochs, lr, history, dataset_key=None):
     return next((item for item in alternatives if item not in tried), current)
 ```
 
-- [ ] **Step 4: Force C to one epoch and wire the C prompt/fallback**
+- [x] **Step 4: Force C to one epoch and wire the C prompt/fallback**
 
 Add this first branch to `_apply_profile_strategy`:
 
@@ -245,7 +245,7 @@ adjusted = _avoid_repeat(
 
 The existing `_apply_profile_strategy()` call then fixes C to one epoch and appends its reason.
 
-- [ ] **Step 5: Run the focused tests**
+- [x] **Step 5: Run the focused tests**
 
 Run:
 
@@ -255,7 +255,7 @@ python -m pytest tests/test_submission_contract.py -k "history_prompt or resourc
 
 Expected: all selected tests pass.
 
-- [ ] **Step 6: Run the complete submission contract suite**
+- [x] **Step 6: Run the complete submission contract suite**
 
 Run:
 
@@ -265,7 +265,7 @@ python -m pytest tests/test_submission_contract.py -q
 
 Expected: all tests pass.
 
-- [ ] **Step 7: Commit the implementation**
+- [x] **Step 7: Commit the implementation**
 
 ```powershell
 git add -- submission/contest_submission.py tests/test_submission_contract.py
@@ -279,7 +279,7 @@ git commit -m "feat: drive C search with platform feedback"
 - Modify: `RUNBOOK.md`
 - Verify: `submission/Dockerfile`
 
-- [ ] **Step 1: Document the two-layer C feedback loop**
+- [x] **Step 1: Document the two-layer C feedback loop**
 
 Add this content to the existing C strategy section in `作品文档.md`:
 
@@ -287,7 +287,7 @@ Add this content to the existing C strategy section in `作品文档.md`:
 - **C 平台反馈搜索**：每轮固定续训 1 个 epoch，Qwen 读取截至当前轮的全部压缩平台公开验证历史并提出下一学习率；同一父产物不重复学习率，C 不跳过训练轮次。SDK 每轮返回的是公开验证摘要，不是隐藏测试指标。隐藏集效果只在整次试运行报告中验收。
 ```
 
-- [ ] **Step 2: Add the post-trial C acceptance check to `RUNBOOK.md`**
+- [x] **Step 2: Add the post-trial C acceptance check to `RUNBOOK.md`**
 
 Add an acceptance block near the submission verification commands:
 
@@ -297,7 +297,7 @@ Add an acceptance block near the submission verification commands:
 SDK 运行中的 `summary.metrics` 是平台公开验证摘要。新镜像试运行完成后，必须在平台报告中检查 C 隐藏测试：RMSE 应低于第一次试运行的 `56.455008`；NASA 非对称分应低于 `96,699,827,373.39221`，至少不得出现数量级恶化。未拿到新平台报告前，只能确认工程策略已生效，不能宣称隐藏集性能已经提升。
 ```
 
-- [ ] **Step 3: Run all relevant tests**
+- [x] **Step 3: Run all relevant tests**
 
 Run:
 
@@ -308,7 +308,7 @@ python -m pytest contest-harness-sdk-1.0.2/tests -q
 
 Expected: project suites pass; SDK live tests may be skipped when live platform variables are absent, with no failures.
 
-- [ ] **Step 4: Build the formal SDK image**
+- [x] **Step 4: Build the formal SDK image**
 
 Run:
 
@@ -318,13 +318,13 @@ docker build -f submission/Dockerfile -t zhixun-submit:latest .
 
 Expected: build completes successfully.
 
-- [ ] **Step 5: Verify the image contract**
+- [x] **Step 5: Verify the image contract**
 
 Run the repository's existing Docker `describe` command from `RUNBOOK.md` against `zhixun-submit:latest`.
 
 Expected: protocol `contest.harness.workspace.v2`, datasets A/B/C, and no nonzero exit code.
 
-- [ ] **Step 6: Commit documentation**
+- [x] **Step 6: Commit documentation**
 
 ```powershell
 git add -- '作品文档.md' RUNBOOK.md
