@@ -86,6 +86,8 @@ def test_error_stream_reports_rate():
 
 def test_error_stream_detects_sudden_change():
     mon = ErrorStreamMonitor("adwin")
+    if mon.kind == "none":
+        pytest.skip("可选 frouros 未安装；正式 SDK 使用平台指标漂移检测")
     clean = np.ones(500, dtype=int)
     mon.update(clean, clean)                      # 全对
     res = mon.update(clean, np.full(500, 2))      # 突然全错
