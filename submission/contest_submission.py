@@ -154,7 +154,7 @@ def _select_from_platform(*, task, metric, direction, candidate, parent,
 
 def _history_prompt(history):
     lines = []
-    for record in history[-6:]:
+    for record in history[-3:]:
         config = record.get("configuration") if isinstance(record, dict) else {}
         config = config if isinstance(config, dict) else {}
         metrics = _history_metrics(record)
@@ -200,6 +200,25 @@ def _complete_sdk_loop_count(history):
         if isinstance(evidence, dict) and evidence.get("complete") is True:
             count += 1
     return count
+
+
+def _should_skip_training(history, parent_artifact_id):
+    if _complete_sdk_loop_count(history) < 3 or len(history) < 2:
+        return False
+    recent = history[-2:]
+    for record in recent:
+        config = record.get("configuration") if isinstance(record, dict) else None
+        if (not isinstance(config, dict)
+                or config.get("parent_artifact_id") != parent_artifact_id
+                or config.get("resource_action") == "training_skipped"):
+            return False
+        decision = config.get("platform_decision")
+        drift = config.get("platform_drift")
+        if (not isinstance(decision, dict)
+                or decision.get("reason") in ("candidate_better", "first_round_valid_candidate")
+                or not isinstance(drift, dict) or drift.get("status") == "HARMFUL"):
+            return False
+    return True
 
 
 def _parent_metrics(rnd, history):
@@ -335,7 +354,8 @@ def _ask_model(rnd, task, metric, history):
     epochs, lr, hypothesis = 5, None, "回退官方默认超参续训一轮"
     receipt = rnd.model(
         [{"role": "user", "content": user}],
-        max_tokens=min(256, rnd.max_output_tokens), temperature=0,
+        max_tokens=min(96, rnd.max_output_tokens), temperature=0,
+        enable_thinking=False,
         response_format={"type": "json_object"})
     try:
         data = _extract_json(receipt.text)
@@ -397,6 +417,36 @@ def train(rnd):
     history = rnd.history()
     epochs, lr, reset_optimizer, hypothesis, call_id = _ask_model(
         rnd, task, metric, history)
+
+    if _should_skip_training(history, rnd.parent.artifact_id):
+        parent_metrics = _parent_metrics(rnd, history)
+        loop_evidence = _loop_evidence(
+            history, rnd.call_ids, hypothesis, "training_skipped", "resource_policy")
+        rnd.finish(
+            selected_artifact_id=rnd.parent.artifact_id,
+            hypothesis=hypothesis,
+            change_summary="连续两轮无改善且无有害漂移，本轮跳过工业训练",
+            reason=f"资源策略：保留父模型并跳过一次训练；模型建议调用 {call_id}。",
+            configuration={
+                "epochs": epochs, "learning_rate": lr,
+                "optimizer_moments_reset": reset_optimizer,
+                "parent_artifact_id": rnd.parent.artifact_id,
+                "model_call_id": call_id, "resource_action": "training_skipped",
+                "platform_metrics": {},
+                "parent_platform_metrics": parent_metrics,
+                "selected_platform_metrics": parent_metrics,
+                "selected_source": "parent",
+                "platform_drift": {
+                    "detector": "platform_metric_delta", "enabled": False,
+                    "status": "NOT_MEASURED", "reason": "training_skipped",
+                    "drift_detected": False,
+                },
+                "loop_evidence": loop_evidence,
+                "complete_loops_total": _complete_sdk_loop_count(history),
+            },
+            seed=42, history_ids=[h["id"] for h in history],
+            model_call_ids=list(rnd.call_ids))
+        return
 
     work = Path(os.environ.get("CONTEST_WORK", "/workspace"))
     cand = work / "cand"                                      # train_run 要求新目录

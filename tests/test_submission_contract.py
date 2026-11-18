@@ -206,6 +206,17 @@ def test_history_prompt_contains_formal_platform_drift():
     assert "-0.05" in prompt
 
 
+def test_history_prompt_keeps_only_latest_three_rounds():
+    history = [
+        {"id": f"r{i}", "round_index": i,
+         "summary": {"metrics": {"rmse": float(i)}}, "configuration": {}}
+        for i in range(1, 6)
+    ]
+    prompt = cs._history_prompt(history)
+    assert "轮1:" not in prompt and "轮2:" not in prompt
+    assert all(f"轮{i}:" in prompt for i in (3, 4, 5))
+
+
 def test_first_round_loop_evidence_is_complete_with_empty_history():
     evidence = cs._loop_evidence(
         [], ["call-1"], "首轮假设", "candidate_measured", "platform_summary")
@@ -222,6 +233,27 @@ def test_complete_sdk_loop_count_uses_structured_formal_evidence():
         {"configuration": {"loop_evidence": {"complete": False}}},
     ]
     assert cs._complete_sdk_loop_count(history) == 3
+
+
+def test_resource_skip_requires_three_loops_two_rejections_and_no_harmful_drift():
+    history = []
+    for index in range(1, 4):
+        history.append({
+            "id": f"r{index}", "selected_artifact_id": "parent-1",
+            "configuration": {
+                "parent_artifact_id": "parent-1",
+                "loop_evidence": {"complete": True},
+                "platform_decision": {"reason": "candidate_not_better"},
+                "platform_drift": {"status": "STABLE"},
+            },
+        })
+    assert cs._should_skip_training(history, "parent-1") is True
+
+    history[-1]["configuration"]["resource_action"] = "training_skipped"
+    assert cs._should_skip_training(history, "parent-1") is False
+    history[-1]["configuration"].pop("resource_action")
+    history[-1]["configuration"]["platform_drift"]["status"] = "HARMFUL"
+    assert cs._should_skip_training(history, "parent-1") is False
 
 
 def test_parent_metrics_prefers_matching_parent_artifact():
@@ -366,7 +398,8 @@ class _Round:
 
     def model(self, messages, **options):
         assert options["response_format"] == {"type": "json_object"}
-        assert options["max_tokens"] <= 256
+        assert options["max_tokens"] <= 96
+        assert options["enable_thinking"] is False
         self.call_ids.append("call-1")
         return type("Receipt", (), {
             "call_id": "call-1",
@@ -447,6 +480,37 @@ def test_train_failure_records_complete_formal_loop(monkeypatch, tmp_path):
     assert evidence["experiment_status"] == "train_failed"
     assert evidence["decision_source"] == "failure_fallback"
     assert rnd.finished["configuration"]["platform_drift"]["status"] == "UNKNOWN"
+
+
+def test_train_can_skip_one_low_value_round_after_three_complete_loops(
+        monkeypatch, tmp_path):
+    history = []
+    for index in range(1, 4):
+        history.append({
+            "id": f"r{index}", "round_index": index,
+            "selected_artifact_id": "parent-1",
+            "summary": {"metrics": {"macro_f1": 0.80, "accuracy": 0.90}},
+            "configuration": {
+                "parent_artifact_id": "parent-1",
+                "epochs": 5, "learning_rate": 0.001,
+                "loop_evidence": {"complete": True},
+                "platform_decision": {"reason": "candidate_not_better"},
+                "platform_drift": {"status": "STABLE"},
+            },
+        })
+    rnd = _Round(history, {"macro_f1": 0.81}, round_index=4)
+    monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
+    monkeypatch.setattr(
+        cs.subprocess, "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("training must be skipped")))
+
+    cs.train(rnd)
+
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert rnd.finished["configuration"]["resource_action"] == "training_skipped"
+    assert rnd.finished["configuration"]["complete_loops_total"] == 3
+    assert rnd.finished["configuration"]["loop_evidence"]["complete"] is False
 
 
 def test_train_can_restore_allowed_platform_history_best(monkeypatch, tmp_path):
