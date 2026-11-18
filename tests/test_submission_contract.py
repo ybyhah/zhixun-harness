@@ -206,15 +206,18 @@ def test_history_prompt_contains_formal_platform_drift():
     assert "-0.05" in prompt
 
 
-def test_history_prompt_keeps_only_latest_three_rounds():
+def test_history_prompt_defaults_to_latest_three_but_can_include_all_rounds():
     history = [
         {"id": f"r{i}", "round_index": i,
          "summary": {"metrics": {"rmse": float(i)}}, "configuration": {}}
         for i in range(1, 6)
     ]
-    prompt = cs._history_prompt(history)
-    assert "轮1:" not in prompt and "轮2:" not in prompt
-    assert all(f"轮{i}:" in prompt for i in (3, 4, 5))
+    default_prompt = cs._history_prompt(history)
+    assert "轮1:" not in default_prompt and "轮2:" not in default_prompt
+    assert all(f"轮{i}:" in default_prompt for i in (3, 4, 5))
+
+    full_prompt = cs._history_prompt(history, include_all=True)
+    assert all(f"轮{i}:" in full_prompt for i in range(1, 6))
 
 
 def test_first_round_loop_evidence_is_complete_with_empty_history():
@@ -256,6 +259,20 @@ def test_resource_skip_requires_three_loops_two_rejections_and_no_harmful_drift(
     assert cs._should_skip_training(history, "parent-1") is False
 
 
+def test_c_resource_policy_never_skips_a_platform_round():
+    history = [{
+        "id": f"r{i}", "selected_artifact_id": "parent-c",
+        "configuration": {
+            "parent_artifact_id": "parent-c",
+            "loop_evidence": {"complete": True},
+            "platform_decision": {"reason": "candidate_not_better"},
+            "platform_drift": {"status": "STABLE"},
+        },
+    } for i in range(1, 4)]
+    assert cs._should_skip_training(
+        history, "parent-c", dataset_key="C") is False
+
+
 def test_parent_metrics_prefers_matching_parent_artifact():
     history = [
         {"id": "r1", "selected_artifact_id": "old", "summary": {"metrics": {"rmse": 11.0}}},
@@ -292,6 +309,19 @@ def test_avoid_repeat_changes_duplicate_configuration():
     assert cs._avoid_repeat("parent-0", 5, 0.001, history) != (5, 0.001)
 
 
+def test_c_avoid_repeat_compares_learning_rate_after_epoch_is_fixed():
+    history = [{
+        "configuration": {
+            "parent_artifact_id": "parent-c", "epochs": 9,
+            "learning_rate": 0.001,
+        }
+    }]
+    epochs, learning_rate = cs._avoid_repeat(
+        "parent-c", 1, 0.001, history, dataset_key="C")
+    assert epochs == 1
+    assert learning_rate == pytest.approx(0.0005)
+
+
 @pytest.mark.parametrize("round_index", [1, 2])
 def test_a_early_round_strategy_uses_strong_known_start(round_index):
     epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
@@ -304,6 +334,13 @@ def test_a_early_round_strategy_uses_strong_known_start(round_index):
 def test_a_third_round_keeps_qwen_proposal():
     assert cs._apply_profile_strategy(
         "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, False, "")
+
+
+def test_c_strategy_forces_one_epoch_and_keeps_qwen_learning_rate():
+    result = cs._apply_profile_strategy(
+        "C", 4, 20, 0.0005, [], "parent-c")
+    assert result == (
+        1, 0.0005, False, "C_platform_search:单步续训便于平台反馈归因")
 
 
 def test_b_stagnation_switches_to_first_untried_axis():
@@ -511,6 +548,51 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
     assert rnd.finished["configuration"]["resource_action"] == "training_skipped"
     assert rnd.finished["configuration"]["complete_loops_total"] == 3
     assert rnd.finished["configuration"]["loop_evidence"]["complete"] is False
+
+
+def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
+    history = [{
+        "id": f"r{i}", "round_index": i,
+        "selected_artifact_id": "parent-1",
+        "summary": {"metrics": {
+            "rmse": 52.0, "nasa_asymmetric_score": 100.0}},
+        "configuration": {
+            "parent_artifact_id": "parent-1", "epochs": 5,
+            "learning_rate": 0.001,
+            "loop_evidence": {"complete": True},
+            "platform_decision": {"reason": "candidate_not_better"},
+            "platform_drift": {"status": "STABLE"},
+        },
+    } for i in range(1, 4)]
+    rnd = _Round(
+        history, {"rmse": 51.9, "nasa_asymmetric_score": 99.0},
+        round_index=4)
+    rnd.dataset_key = "C"
+    rnd.task = {
+        "task": "regression", "metric": "rmse", "metric_direction": "lower"}
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        cand = tmp_path / "cand"
+        cand.mkdir()
+        (cand / "checkpoint.npz").write_bytes(b"checkpoint")
+        (cand / "training.json").write_text(json.dumps({
+            "seed": 42,
+            "validation_before": {"rmse": 52.0},
+            "validation_after": {"rmse": 51.9},
+        }), encoding="utf-8")
+        return type("Proc", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
+    monkeypatch.setattr(cs.subprocess, "run", run)
+    monkeypatch.setattr(
+        cs, "_decide_promote", lambda *a, **k: (True, {"p": 1.0}))
+    cs.train(rnd)
+
+    index = seen["cmd"].index("--epochs")
+    assert seen["cmd"][index + 1] == "1"
+    assert rnd.finished["configuration"].get("resource_action") is None
 
 
 def test_train_can_restore_allowed_platform_history_best(monkeypatch, tmp_path):

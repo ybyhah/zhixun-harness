@@ -152,9 +152,10 @@ def _select_from_platform(*, task, metric, direction, candidate, parent,
     return True, {**detail, "reason": "candidate_better"}
 
 
-def _history_prompt(history):
+def _history_prompt(history, include_all=False):
     lines = []
-    for record in history[-3:]:
+    records = history if include_all else history[-3:]
+    for record in records:
         config = record.get("configuration") if isinstance(record, dict) else {}
         config = config if isinstance(config, dict) else {}
         metrics = _history_metrics(record)
@@ -202,7 +203,9 @@ def _complete_sdk_loop_count(history):
     return count
 
 
-def _should_skip_training(history, parent_artifact_id):
+def _should_skip_training(history, parent_artifact_id, dataset_key=None):
+    if str(dataset_key).upper() == "C":
+        return False
     if _complete_sdk_loop_count(history) < 3 or len(history) < 2:
         return False
     recent = history[-2:]
@@ -275,9 +278,12 @@ def _best_allowed_history(history, artifacts, metric, direction, parent_metrics,
     return best
 
 
-def _avoid_repeat(parent_artifact_id, epochs, lr, history):
+def _avoid_repeat(parent_artifact_id, epochs, lr, history, dataset_key=None):
     if lr is None:
         return epochs, lr
+    c_search = str(dataset_key).upper() == "C"
+    if c_search:
+        epochs = 1
     tried = set()
     for record in history:
         config = record.get("configuration") if isinstance(record, dict) else None
@@ -285,10 +291,20 @@ def _avoid_repeat(parent_artifact_id, epochs, lr, history):
             continue
         old_epochs, old_lr = config.get("epochs"), config.get("learning_rate")
         if isinstance(old_epochs, int) and _finite_number(old_lr):
-            tried.add((old_epochs, float(old_lr)))
-    current = (epochs, float(lr))
+            tried.add(float(old_lr) if c_search else (old_epochs, float(old_lr)))
+    current = float(lr) if c_search else (epochs, float(lr))
     if current not in tried:
-        return current
+        return epochs, float(lr)
+    if c_search:
+        alternatives = []
+        for power in range(1, 11):
+            alternatives.extend((
+                float(_clamp(lr / (2 ** power), *LR_RANGE)),
+                float(_clamp(lr * (2 ** power), *LR_RANGE)),
+            ))
+        replacement = next(
+            (value for value in alternatives if value not in tried), float(lr))
+        return 1, replacement
     alternatives = [
         (epochs, float(_clamp(lr / 2, *LR_RANGE))),
         (epochs, float(_clamp(lr * 2, *LR_RANGE))),
@@ -301,6 +317,8 @@ def _avoid_repeat(parent_artifact_id, epochs, lr, history):
 def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                             parent_artifact_id):
     profile = str(dataset_key).upper()
+    if profile == "C":
+        return 1, lr, False, "C_platform_search:单步续训便于平台反馈归因"
     if profile == "A" and round_index in (1, 2):
         return 10, 0.01, False, "A_early_round:前两轮采用已验证的强起点"
     if profile == "B":
@@ -344,14 +362,18 @@ def _ask_model(rnd, task, metric, history):
     """
     hib = rnd.task.get("metric_direction", "higher" if task == "classification" else "lower") == "higher"
     direction = "越大越好" if hib else "越小越好"
-    hist = _history_prompt(history)
+    c_search = str(rnd.dataset_key).upper() == "C"
+    hist = _history_prompt(history, include_all=c_search)
+    request = ('{"learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}'
+               if c_search else
+               '{"epochs": 整数1-50, "learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}')
     user = (
         f"数据集 {rnd.dataset_key}，任务 {task}，主指标 {metric}（{direction}）。\n"
         f"本轮从父检查点续训，梯度只用公开训练集。历史检查点表现：\n{hist}\n\n"
-        "请给出本轮续训超参，严格只输出 JSON："
-        '{"epochs": 整数1-50, "learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}'
+        f"请给出本轮续训超参，严格只输出 JSON：{request}"
     )
-    epochs, lr, hypothesis = 5, None, "回退官方默认超参续训一轮"
+    epochs, lr = (1, 0.001) if c_search else (5, None)
+    hypothesis = "回退官方默认超参续训一轮"
     receipt = rnd.model(
         [{"role": "user", "content": user}],
         max_tokens=min(96, rnd.max_output_tokens), temperature=0,
@@ -359,13 +381,16 @@ def _ask_model(rnd, task, metric, history):
         response_format={"type": "json_object"})
     try:
         data = _extract_json(receipt.text)
-        epochs = int(_clamp(int(data["epochs"]), *EPOCH_RANGE))
+        if not c_search:
+            epochs = int(_clamp(int(data["epochs"]), *EPOCH_RANGE))
         lr = float(_clamp(float(data["learning_rate"]), *LR_RANGE))
         if isinstance(data.get("hypothesis"), str) and data["hypothesis"].strip():
             hypothesis = data["hypothesis"].strip()[:2000]
     except Exception as exc:  # noqa: BLE001 —— 慢通路失败回退，不中断本轮
         hypothesis = f"模型回复不可用（{type(exc).__name__}），回退官方默认超参"
-    adjusted = _avoid_repeat(rnd.parent.artifact_id, epochs, lr, history)
+    adjusted = _avoid_repeat(
+        rnd.parent.artifact_id, epochs, lr, history,
+        dataset_key=rnd.dataset_key)
     if adjusted != (epochs, lr):
         epochs, lr = adjusted
         hypothesis += "；检测到同一父模型下重复配置，已确定性换轴"
@@ -418,7 +443,8 @@ def train(rnd):
     epochs, lr, reset_optimizer, hypothesis, call_id = _ask_model(
         rnd, task, metric, history)
 
-    if _should_skip_training(history, rnd.parent.artifact_id):
+    if _should_skip_training(
+            history, rnd.parent.artifact_id, dataset_key=rnd.dataset_key):
         parent_metrics = _parent_metrics(rnd, history)
         loop_evidence = _loop_evidence(
             history, rnd.call_ids, hypothesis, "training_skipped", "resource_policy")
