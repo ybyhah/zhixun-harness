@@ -82,6 +82,46 @@ def test_c_candidate_with_worse_nasa_is_rejected_even_when_rmse_improves():
     assert detail["reason"] == "nasa_stability_veto"
 
 
+@pytest.mark.parametrize(
+    "metric,direction,candidate,parent,expected_gain",
+    [
+        ("macro_f1", "higher", {"macro_f1": 0.75}, {"macro_f1": 0.80}, -0.0625),
+        ("rmse", "lower", {"rmse": 110.0}, {"rmse": 100.0}, -0.10),
+    ],
+)
+def test_platform_metric_drift_detects_relative_degradation(
+        metric, direction, candidate, parent, expected_gain):
+    drift = cs._platform_metric_drift(metric, direction, candidate, parent)
+    assert drift["detector"] == "platform_metric_delta"
+    assert drift["enabled"] is True
+    assert drift["status"] == "HARMFUL"
+    assert drift["drift_detected"] is True
+    assert drift["reason"] == "main_metric_degraded"
+    assert drift["relative_gain"] == pytest.approx(expected_gain)
+
+
+def test_platform_metric_drift_handles_stable_and_missing_metrics():
+    stable = cs._platform_metric_drift(
+        "macro_f1", "higher", {"macro_f1": 0.80}, {"macro_f1": 0.80})
+    assert stable["status"] == "STABLE"
+    assert stable["drift_detected"] is False
+    unknown = cs._platform_metric_drift("rmse", "lower", {}, {"rmse": 100.0})
+    assert unknown["status"] == "UNKNOWN"
+    assert unknown["reason"] == "metric_missing"
+    assert unknown["drift_detected"] is False
+
+
+def test_platform_metric_drift_detects_c_nasa_worsening():
+    drift = cs._platform_metric_drift(
+        "rmse", "lower",
+        {"rmse": 9.0, "nasa_asymmetric_score": 110.0},
+        {"rmse": 10.0, "nasa_asymmetric_score": 100.0},
+        dataset_key="C")
+    assert drift["status"] == "HARMFUL"
+    assert drift["reason"] == "nasa_worsened"
+    assert drift["drift_detected"] is True
+
+
 def test_history_metrics_reads_platform_summary_and_configuration_fallback():
     assert cs._history_metrics({"summary": {"metrics": {"rmse": 9.5}}}) == {"rmse": 9.5}
     assert cs._history_metrics({"metrics": {"rmse": 9.6}}) == {"rmse": 9.6}
@@ -102,6 +142,23 @@ def test_history_prompt_contains_platform_metric_and_configuration():
     assert '"rmse": 9.5' in prompt
     assert "epochs=5" in prompt
     assert "lr=0.001" in prompt
+
+
+def test_history_prompt_contains_formal_platform_drift():
+    history = [{
+        "id": "r1", "round_index": 1,
+        "summary": {"metrics": {"rmse": 10.0}},
+        "configuration": {
+            "platform_drift": {
+                "status": "HARMFUL", "reason": "main_metric_degraded",
+                "relative_gain": -0.05,
+            }
+        },
+    }]
+    prompt = cs._history_prompt(history)
+    assert "drift=HARMFUL" in prompt
+    assert "main_metric_degraded" in prompt
+    assert "-0.05" in prompt
 
 
 def test_parent_metrics_prefers_matching_parent_artifact():

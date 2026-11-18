@@ -16,6 +16,7 @@ PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
 BASELINES_DIR = Path(__file__).resolve().parent / "baselines"   # 镜像内 /app/baselines
 EPOCH_RANGE = (1, 50)
 LR_RANGE = (1e-6, 0.1)
+DRIFT_RELATIVE_THRESHOLD = 0.02
 _MODEL_CACHE: dict = {}
 
 
@@ -82,6 +83,35 @@ def _nasa_value(metrics):
     return None
 
 
+def _platform_metric_drift(metric, direction, candidate, parent, dataset_key=None):
+    cand = _metric_value(candidate, metric)
+    prev = _metric_value(parent, metric)
+    result = {
+        "detector": "platform_metric_delta", "enabled": True,
+        "metric": metric, "candidate": cand, "parent": prev,
+        "relative_gain": None, "threshold": DRIFT_RELATIVE_THRESHOLD,
+        "status": "UNKNOWN", "reason": "metric_missing",
+        "drift_detected": False,
+    }
+    if cand is None or prev is None:
+        return result
+    scale = max(abs(prev), 1e-12)
+    gain = ((cand - prev) if direction == "higher" else (prev - cand)) / scale
+    result["relative_gain"] = gain
+    if str(dataset_key).upper() == "C":
+        cand_nasa, prev_nasa = _nasa_value(candidate), _nasa_value(parent)
+        if cand_nasa is not None and prev_nasa is not None and cand_nasa > prev_nasa:
+            return {**result, "status": "HARMFUL", "reason": "nasa_worsened",
+                    "drift_detected": True, "candidate_nasa": cand_nasa,
+                    "parent_nasa": prev_nasa}
+    if gain < -DRIFT_RELATIVE_THRESHOLD:
+        return {**result, "status": "HARMFUL",
+                "reason": "main_metric_degraded", "drift_detected": True}
+    if gain > 0:
+        return {**result, "status": "IMPROVED", "reason": "metric_improved"}
+    return {**result, "status": "STABLE", "reason": "within_threshold"}
+
+
 def _select_from_platform(*, task, metric, direction, candidate, parent,
                           first_round, dataset_key=None):
     """Choose from authoritative platform metrics; local scores never decide."""
@@ -112,11 +142,16 @@ def _history_prompt(history):
         config = record.get("configuration") if isinstance(record, dict) else {}
         config = config if isinstance(config, dict) else {}
         metrics = _history_metrics(record)
+        drift = config.get("platform_drift")
+        drift = drift if isinstance(drift, dict) else {}
         lines.append(
             f"  轮{record.get('round_index', '?')}: "
             f"platform_metrics={json.dumps(metrics, ensure_ascii=False)}; "
             f"epochs={config.get('epochs', '?')}; lr={config.get('learning_rate', '?')}; "
-            f"selected={record.get('selected_artifact_id', '?')}"
+            f"selected={record.get('selected_artifact_id', '?')}; "
+            f"drift={drift.get('status', 'UNKNOWN')}/"
+            f"{drift.get('reason', 'missing')}/"
+            f"{drift.get('relative_gain', '?')}"
         )
     return "\n".join(lines) if lines else "  （暂无历史）"
 
