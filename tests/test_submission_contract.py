@@ -82,6 +82,41 @@ def test_c_candidate_with_worse_nasa_is_rejected_even_when_rmse_improves():
     assert detail["reason"] == "nasa_stability_veto"
 
 
+def test_c_candidate_allows_small_nasa_tradeoff_when_rmse_improves():
+    selected, detail = cs._select_from_platform(
+        task="regression", metric="rmse", direction="lower",
+        candidate={"rmse": 9.0, "nasa_asymmetric_score": 104.9},
+        parent={"rmse": 10.0, "nasa_asymmetric_score": 100.0},
+        first_round=False, dataset_key="C",
+    )
+    assert selected is True
+    assert detail["reason"] == "candidate_better"
+
+
+def test_a_candidate_requires_meaningful_f1_gain_and_accuracy_floor():
+    parent = {"macro_f1": 0.800, "accuracy": 0.900}
+    small_gain, detail = cs._select_from_platform(
+        task="classification", metric="macro_f1", direction="higher",
+        candidate={"macro_f1": 0.801, "accuracy": 0.901}, parent=parent,
+        first_round=False, dataset_key="A")
+    assert small_gain is False
+    assert detail["reason"] == "gain_below_minimum"
+
+    accuracy_drop, detail = cs._select_from_platform(
+        task="classification", metric="macro_f1", direction="higher",
+        candidate={"macro_f1": 0.803, "accuracy": 0.897}, parent=parent,
+        first_round=False, dataset_key="A")
+    assert accuracy_drop is False
+    assert detail["reason"] == "accuracy_floor"
+
+    accepted, detail = cs._select_from_platform(
+        task="classification", metric="macro_f1", direction="higher",
+        candidate={"macro_f1": 0.803, "accuracy": 0.899}, parent=parent,
+        first_round=False, dataset_key="A")
+    assert accepted is True
+    assert detail["reason"] == "candidate_better"
+
+
 @pytest.mark.parametrize(
     "metric,direction,candidate,parent,expected_gain",
     [
@@ -120,6 +155,16 @@ def test_platform_metric_drift_detects_c_nasa_worsening():
     assert drift["status"] == "HARMFUL"
     assert drift["reason"] == "nasa_worsened"
     assert drift["drift_detected"] is True
+
+
+def test_platform_metric_drift_tolerates_small_c_nasa_tradeoff():
+    drift = cs._platform_metric_drift(
+        "rmse", "lower",
+        {"rmse": 9.0, "nasa_asymmetric_score": 104.9},
+        {"rmse": 10.0, "nasa_asymmetric_score": 100.0},
+        dataset_key="C")
+    assert drift["status"] == "IMPROVED"
+    assert drift["drift_detected"] is False
 
 
 def test_history_metrics_reads_platform_summary_and_configuration_fallback():

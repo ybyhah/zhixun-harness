@@ -17,6 +17,9 @@ BASELINES_DIR = Path(__file__).resolve().parent / "baselines"   # 镜像内 /app
 EPOCH_RANGE = (1, 50)
 LR_RANGE = (1e-6, 0.1)
 DRIFT_RELATIVE_THRESHOLD = 0.02
+A_MIN_MACRO_F1_GAIN = 0.002
+A_ACCURACY_TOLERANCE = 0.002
+C_NASA_TOLERANCE = 0.05
 _MODEL_CACHE: dict = {}
 
 
@@ -100,7 +103,8 @@ def _platform_metric_drift(metric, direction, candidate, parent, dataset_key=Non
     result["relative_gain"] = gain
     if str(dataset_key).upper() == "C":
         cand_nasa, prev_nasa = _nasa_value(candidate), _nasa_value(parent)
-        if cand_nasa is not None and prev_nasa is not None and cand_nasa > prev_nasa:
+        if (cand_nasa is not None and prev_nasa is not None
+                and cand_nasa > prev_nasa * (1 + C_NASA_TOLERANCE)):
             return {**result, "status": "HARMFUL", "reason": "nasa_worsened",
                     "drift_detected": True, "candidate_nasa": cand_nasa,
                     "parent_nasa": prev_nasa}
@@ -128,9 +132,21 @@ def _select_from_platform(*, task, metric, direction, candidate, parent,
     better = cand > prev if direction == "higher" else cand < prev
     if not better:
         return False, {**detail, "reason": "candidate_not_better"}
+    if str(dataset_key).upper() == "A":
+        if cand - prev < A_MIN_MACRO_F1_GAIN:
+            return False, {**detail, "reason": "gain_below_minimum",
+                           "minimum_gain": A_MIN_MACRO_F1_GAIN}
+        cand_accuracy = _metric_value(candidate, "accuracy")
+        prev_accuracy = _metric_value(parent, "accuracy")
+        if (cand_accuracy is not None and prev_accuracy is not None
+                and cand_accuracy < prev_accuracy - A_ACCURACY_TOLERANCE):
+            return False, {**detail, "reason": "accuracy_floor",
+                           "candidate_accuracy": cand_accuracy,
+                           "parent_accuracy": prev_accuracy}
     if str(dataset_key).upper() == "C":
         cand_nasa, prev_nasa = _nasa_value(candidate), _nasa_value(parent)
-        if cand_nasa is not None and prev_nasa is not None and cand_nasa > prev_nasa:
+        if (cand_nasa is not None and prev_nasa is not None
+                and cand_nasa > prev_nasa * (1 + C_NASA_TOLERANCE)):
             return False, {**detail, "reason": "nasa_stability_veto",
                            "candidate_nasa": cand_nasa, "parent_nasa": prev_nasa}
     return True, {**detail, "reason": "candidate_better"}
