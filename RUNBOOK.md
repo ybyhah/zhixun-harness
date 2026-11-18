@@ -26,6 +26,15 @@ python3 /app/harness.py predict
 C 使用寿命高估惩罚并同时检查平台 NASA 指标。最终产物只从当前候选、父模型和平台授权的
 历史 artifact 中按平台 `summary.metrics` 选择。
 
+每轮完成记录还包含：
+
+- `configuration.loop_evidence`：历史读取、Qwen 调用、实验状态、决策来源及完整性；
+- `configuration.complete_loops_total`：正式 SDK 完整闭环累计数；
+- `configuration.platform_drift`：无外部依赖的平台主指标相对漂移，C 同时检查 NASA。
+
+`platform_metric_delta` 是正式评分口径下的性能漂移检测，不是输入特征 PSI。旧本地模拟器的
+ADWIN 依赖 `frouros`，未安装时按设计降级，不影响正式提交镜像。
+
 本地只验证 `describe`：
 
 ```bash
