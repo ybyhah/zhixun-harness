@@ -22,9 +22,15 @@ python3 /app/harness.py predict
 
 模型只通过 SDK 的 `rnd.model()` 调用，PyTRiO 密钥由平台持有。公开训练/验证投影、父产物和工作目录分别由平台挂载到 `/data`、`/previous` 和 `/workspace`，不使用下面的本地 `base/` 挂载命令。
 
-正式链路会保存本轮验证最优 epoch；A 前两轮使用固定强起点，B 在一轮无改善后自动换轴，
-C 使用寿命高估惩罚并同时检查平台 NASA 指标。最终产物只从当前候选、父模型和平台授权的
-历史 artifact 中按平台 `summary.metrics` 选择。
+正式链路会保存本轮验证最优 epoch；A 前两轮使用固定强起点，后续上线要求 Macro-F1
+至少提升 0.002 且 Accuracy 不明显退化；B 在一轮无改善后自动换轴，并只在换轴轮重置
+Adam 动量；C 使用官方回归损失，以 RMSE + NASA 选择本轮最佳 epoch，连续 3 epoch
+无改善时早停。最终产物只从当前候选、父模型和平台授权的历史 artifact 中按平台
+`summary.metrics` 选择，C 的 NASA 相对退化超过 5% 时禁止上线。
+
+Qwen 每轮读取最近 3 轮压缩历史，`enable_thinking=false`，最多输出 96 Token。正式闭环
+累计达到 3 次后，同一父模型连续两轮无改善且没有 HARMFUL 漂移时可跳过一次工业训练；
+跳过不会连续发生，下一轮恢复实验。
 
 每轮完成记录还包含：
 
@@ -129,6 +135,17 @@ python3 scripts/run_loop.py --config configs/a1_gas.yaml
 
 ## 5. 实测结果
 
+三个官方包的静态基线来自各包 `training.json`，当前值为 A Macro-F1 0.7140297、
+B RMSE 681.1598、C RMSE 52.86857。生成本地客观评分代理表：
+
+```bash
+python3 scripts/objective_score_proxy.py \
+  --report-dir reports/objective_score_proxy_2026-11-18
+```
+
+代理表汇总平均相对提升、最差轮次、恢复轮数、最大回撤、耗时和上线率，仅用于提交前
+横向比较，不等同于平台正式客观分数。
+
 ### 容器内（离线、4 核 8G 限制）
 
 | 包 | 轮数 | 官方基线 | 我们最优 | 优于基线 | 闭环 | 耗时 | 峰值内存 |
@@ -178,5 +195,6 @@ python3 scripts/verify_contest_conditions.py          # 宿主机
 | `outputs/official/{a,b,c}/round-*/` | 每轮官方 `checkpoint.npz` + `training.json` + `history.jsonl` |
 | `outputs/CONCLUSIONS.md` | 全部实验结论 |
 | `outputs/swanlog/`（默认 SWANLAB=1） | SwanLab 离线记录，赛后用 `scripts/swanlab_sync.py` 上传 |
+| `reports/objective_score_proxy_*/` | 基于官方静态基线的客观评分代理 CSV 与 Markdown |
 
 **最终交付的 checkpoint** 由日志末尾的"交付 checkpoint"一行给出（显著性确认链优先）。
