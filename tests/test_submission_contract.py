@@ -336,11 +336,91 @@ def test_a_third_round_keeps_qwen_proposal():
         "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, False, "")
 
 
-def test_c_strategy_forces_one_epoch_and_keeps_qwen_learning_rate():
+def test_c_first_round_restores_first_submission_safe_start():
+    result = cs._apply_profile_strategy(
+        "C", 1, 20, 0.01, [], "baseline-c")
+    assert result == (
+        5, 0.001, False,
+        "C_first_submission_start:恢复首次提交的RMSE_MAE安全起点")
+
+
+def test_c_second_round_restores_first_submission_followup():
+    history = [{
+        "selected_artifact_id": "round-1-c",
+        "configuration": {
+            "parent_artifact_id": "baseline-c", "epochs": 5,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "first_round_valid_candidate"},
+        }
+    }]
+    result = cs._apply_profile_strategy(
+        "C", 2, 20, 0.01, history, "round-1-c")
+    assert result == (
+        3, 0.0005, False,
+        "C_first_submission_followup:恢复首次提交的RMSE_MAE安全续训")
+
+
+def test_c_second_round_retries_safe_start_when_first_round_was_not_selected():
+    history = [{
+        "selected_artifact_id": "baseline-c",
+        "configuration": {
+            "parent_artifact_id": "baseline-c", "epochs": 5,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "candidate_not_better"},
+        }
+    }]
+    result = cs._apply_profile_strategy(
+        "C", 2, 20, 0.01, history, "baseline-c")
+    assert result == (
+        5, 0.001, False,
+        "C_first_submission_start:首轮未上线，重试RMSE_MAE安全起点")
+
+
+def test_c_later_strategy_forces_one_epoch_and_keeps_qwen_learning_rate():
     result = cs._apply_profile_strategy(
         "C", 4, 20, 0.0005, [], "parent-c")
     assert result == (
         1, 0.0005, False, "C_platform_search:单步续训便于平台反馈归因")
+
+
+def test_b_first_round_restores_first_submission_start():
+    epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
+        "B", 1, 3, 0.01, [], "baseline-b")
+    assert (epochs, lr) == (10, 0.001)
+    assert reset_optimizer is False
+    assert "B_first_submission_start" in reason
+
+
+def test_b_second_round_restores_first_submission_followup():
+    history = [{
+        "selected_artifact_id": "round-1-b",
+        "configuration": {
+            "parent_artifact_id": "baseline-b", "epochs": 10,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "first_round_valid_candidate"},
+        }
+    }]
+    epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
+        "B", 2, 8, 0.01, history, "round-1-b")
+    assert (epochs, lr) == (5, 0.001)
+    assert reset_optimizer is False
+    assert "B_first_submission_followup" in reason
+
+
+def test_b_second_round_retries_safe_start_when_first_round_was_not_selected():
+    history = [{
+        "selected_artifact_id": "baseline-b",
+        "configuration": {
+            "parent_artifact_id": "baseline-b", "epochs": 10,
+            "learning_rate": 0.001,
+            "platform_decision": {"reason": "candidate_not_better"},
+        }
+    }]
+    epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
+        "B", 2, 8, 0.01, history, "baseline-b")
+    assert (epochs, lr) == (10, 0.001)
+    assert reset_optimizer is False
+    assert "B_first_submission_start" in reason
 
 
 def test_b_stagnation_switches_to_first_untried_axis():
@@ -428,6 +508,7 @@ class _Round:
         self._history = history
         self._summary = summary
         self.artifacts = artifacts or []
+        self.submitted_kwargs = None
         self.finished = None
 
     def history(self):
@@ -444,6 +525,7 @@ class _Round:
         })()
 
     def submit_candidate(self, directory, **kwargs):
+        self.submitted_kwargs = kwargs
         return {"artifact_id": "candidate-1", "summary": {"metrics": self._summary}}
 
     def finish(self, **kwargs):
@@ -496,6 +578,22 @@ def test_train_promotes_platform_improvement_even_if_local_gate_rejects(monkeypa
     assert (rnd.finished["configuration"]["loop_evidence"]["experiment_status"]
             == "candidate_measured")
     assert rnd.finished["configuration"]["platform_drift"]["enabled"] is True
+    candidate_evidence = rnd.submitted_kwargs["configuration"]["report_evidence"]
+    assert rnd.submitted_kwargs["hypothesis"]
+    assert rnd.submitted_kwargs["change_summary"]
+    assert candidate_evidence["hypothesis"] == "test；A_early_round:前两轮采用已验证的强起点"
+    assert candidate_evidence["change_summary"].startswith("从父检查点续训")
+    assert candidate_evidence["model_call_ids"] == ["call-1"]
+    assert candidate_evidence["candidate_count"] == 1
+    finish_evidence = rnd.finished["configuration"]["report_evidence"]
+    assert finish_evidence["hypothesis"] == rnd.finished["hypothesis"]
+    assert finish_evidence["change_summary"] == rnd.finished["change_summary"]
+    assert finish_evidence["reason"] == rnd.finished["reason"]
+    assert finish_evidence["model_call_ids"] == ["call-1"]
+    assert finish_evidence["history_ids"] == ["r1"]
+    assert finish_evidence["candidate_count"] == 1
+    assert finish_evidence["candidate_artifact_ids"] == ["candidate-1"]
+    assert rnd.finished["model_call_ids"] == ["call-1"]
 
 
 def test_train_failure_records_complete_formal_loop(monkeypatch, tmp_path):
@@ -517,6 +615,11 @@ def test_train_failure_records_complete_formal_loop(monkeypatch, tmp_path):
     assert evidence["experiment_status"] == "train_failed"
     assert evidence["decision_source"] == "failure_fallback"
     assert rnd.finished["configuration"]["platform_drift"]["status"] == "UNKNOWN"
+    report = rnd.finished["configuration"]["report_evidence"]
+    assert report["hypothesis"] == rnd.finished["hypothesis"]
+    assert report["reason"] == rnd.finished["reason"]
+    assert report["model_call_ids"] == ["call-1"]
+    assert report["candidate_count"] == 0
 
 
 def test_train_can_skip_one_low_value_round_after_three_complete_loops(
@@ -548,6 +651,10 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
     assert rnd.finished["configuration"]["resource_action"] == "training_skipped"
     assert rnd.finished["configuration"]["complete_loops_total"] == 3
     assert rnd.finished["configuration"]["loop_evidence"]["complete"] is False
+    report = rnd.finished["configuration"]["report_evidence"]
+    assert report["model_call_ids"] == ["call-1"]
+    assert report["history_ids"] == ["r1", "r2", "r3"]
+    assert report["candidate_count"] == 0
 
 
 def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):

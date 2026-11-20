@@ -193,6 +193,22 @@ def _loop_evidence(history, model_call_ids, hypothesis, experiment_status,
     }
 
 
+def _report_evidence(hypothesis, change_summary, reason, history,
+                     model_call_ids, candidate_artifact_ids):
+    return {
+        "hypothesis": hypothesis,
+        "change_summary": change_summary,
+        "reason": reason,
+        "history_ids": [record["id"] for record in history
+                        if isinstance(record, dict)
+                        and isinstance(record.get("id"), str)],
+        "model_call_ids": [call_id for call_id in model_call_ids
+                           if isinstance(call_id, str) and call_id],
+        "candidate_count": len(candidate_artifact_ids),
+        "candidate_artifact_ids": list(candidate_artifact_ids),
+    }
+
+
 def _complete_sdk_loop_count(history):
     count = 0
     for record in history:
@@ -318,10 +334,30 @@ def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                             parent_artifact_id):
     profile = str(dataset_key).upper()
     if profile == "C":
+        if round_index == 1:
+            return 5, 0.001, False, "C_first_submission_start:恢复首次提交的RMSE_MAE安全起点"
+        if round_index == 2:
+            latest = history[-1] if history and isinstance(history[-1], dict) else {}
+            latest_config = latest.get("configuration", {})
+            if (latest.get("selected_artifact_id") == parent_artifact_id
+                    and isinstance(latest_config, dict)
+                    and latest_config.get("parent_artifact_id") != parent_artifact_id):
+                return 3, 0.0005, False, "C_first_submission_followup:恢复首次提交的RMSE_MAE安全续训"
+            return 5, 0.001, False, "C_first_submission_start:首轮未上线，重试RMSE_MAE安全起点"
         return 1, lr, False, "C_platform_search:单步续训便于平台反馈归因"
     if profile == "A" and round_index in (1, 2):
         return 10, 0.01, False, "A_early_round:前两轮采用已验证的强起点"
     if profile == "B":
+        if round_index == 1:
+            return 10, 0.001, False, "B_first_submission_start:恢复首次提交的安全起点"
+        if round_index == 2:
+            latest = history[-1] if history and isinstance(history[-1], dict) else {}
+            latest_config = latest.get("configuration", {})
+            if (latest.get("selected_artifact_id") == parent_artifact_id
+                    and isinstance(latest_config, dict)
+                    and latest_config.get("parent_artifact_id") != parent_artifact_id):
+                return 5, 0.001, False, "B_first_submission_followup:恢复首次提交的安全续训"
+            return 10, 0.001, False, "B_first_submission_start:首轮未上线，重试安全起点"
         configs = [record.get("configuration") for record in history
                    if isinstance(record, dict)]
         matching = [config for config in configs if isinstance(config, dict)
@@ -446,13 +482,15 @@ def train(rnd):
     if _should_skip_training(
             history, rnd.parent.artifact_id, dataset_key=rnd.dataset_key):
         parent_metrics = _parent_metrics(rnd, history)
+        change = "连续两轮无改善且无有害漂移，本轮跳过工业训练"
+        reason = f"资源策略：保留父模型并跳过一次训练；模型建议调用 {call_id}。"
         loop_evidence = _loop_evidence(
             history, rnd.call_ids, hypothesis, "training_skipped", "resource_policy")
         rnd.finish(
             selected_artifact_id=rnd.parent.artifact_id,
             hypothesis=hypothesis,
-            change_summary="连续两轮无改善且无有害漂移，本轮跳过工业训练",
-            reason=f"资源策略：保留父模型并跳过一次训练；模型建议调用 {call_id}。",
+            change_summary=change,
+            reason=reason,
             configuration={
                 "epochs": epochs, "learning_rate": lr,
                 "optimizer_moments_reset": reset_optimizer,
@@ -469,6 +507,8 @@ def train(rnd):
                 },
                 "loop_evidence": loop_evidence,
                 "complete_loops_total": _complete_sdk_loop_count(history),
+                "report_evidence": _report_evidence(
+                    hypothesis, change, reason, history, rnd.call_ids, []),
             },
             seed=42, history_ids=[h["id"] for h in history],
             model_call_ids=list(rnd.call_ids))
@@ -497,11 +537,13 @@ def train(rnd):
             metric, direction, {}, parent_metrics, dataset_key=rnd.dataset_key)
         loop_evidence = _loop_evidence(
             history, rnd.call_ids, hypothesis, "train_failed", "failure_fallback")
+        change = f"续训子进程失败，本轮保留父模型（{err}）"[:3900]
+        reason = f"官方续训失败：{err}；为保证无人干预跑完，保留父模型。模型调用 {call_id}。"
         rnd.finish(
             selected_artifact_id=rnd.parent.artifact_id,
             hypothesis=hypothesis,
-            change_summary=f"续训子进程失败，本轮保留父模型（{err}）"[:3900],
-            reason=f"官方续训失败：{err}；为保证无人干预跑完，保留父模型。模型调用 {call_id}。",
+            change_summary=change,
+            reason=reason,
             configuration={"epochs": epochs, "learning_rate": lr,
                            "optimizer_moments_reset": reset_optimizer,
                            "parent_artifact_id": rnd.parent.artifact_id,
@@ -512,7 +554,10 @@ def train(rnd):
                            "loop_evidence": loop_evidence,
                            "complete_loops_total": (
                                _complete_sdk_loop_count(history)
-                               + int(loop_evidence["complete"]))},
+                               + int(loop_evidence["complete"])),
+                           "report_evidence": _report_evidence(
+                               hypothesis, change, reason, history,
+                               rnd.call_ids, [])},
             seed=42, history_ids=[h["id"] for h in history],
             model_call_ids=list(rnd.call_ids))
         return
@@ -528,7 +573,10 @@ def train(rnd):
                      "optimizer_moments_reset": reset_optimizer,
                      "parent_artifact_id": rnd.parent.artifact_id,
                      "local_validation_after": after,
-                     "local_diagnostic": local_diagnostic}
+                     "local_diagnostic": local_diagnostic,
+                     "report_evidence": _report_evidence(
+                         hypothesis, change, "候选已提交，等待平台摘要",
+                         history, rnd.call_ids, ["pending"])}
     submitted = rnd.submit_candidate(
         cand, hypothesis=hypothesis, change_summary=change,
         configuration=configuration, seed=seed,
@@ -583,6 +631,9 @@ def train(rnd):
               f"平台父模型指标={json.dumps(parent_metrics, ensure_ascii=False)}；"
               f"判定={json.dumps(platform_decision, ensure_ascii=False)}；"
               f"漂移={json.dumps(platform_drift, ensure_ascii=False)}"[:3900])
+    finish_configuration["report_evidence"] = _report_evidence(
+        hypothesis, change, reason, history, rnd.call_ids,
+        [submitted["artifact_id"]])
     rnd.finish(
         selected_artifact_id=selected,
         hypothesis=hypothesis, change_summary=change,
