@@ -7,6 +7,7 @@
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,10 @@ DRIFT_RELATIVE_THRESHOLD = 0.02
 A_MIN_MACRO_F1_GAIN = 0.002
 A_ACCURACY_TOLERANCE = 0.002
 C_NASA_TOLERANCE = 0.05
+PROXY_TOLERANCE = 0.01
+MODEL_MAX_TOKENS = 200
+A_MAX_EPOCHS = 15
+C_PUBLIC_GUARD_TOLERANCE = 0.05
 _MODEL_CACHE: dict = {}
 
 
@@ -32,6 +37,28 @@ def _extract_json(text):
     if start < 0 or end <= start:
         raise ValueError("模型回复没有 JSON 对象")
     return json.loads(text[start:end + 1])
+
+
+_NUMBER_FIELD = r'"{}"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE]-?\d+)?)'
+
+
+def _parse_model_reply(text):
+    """解析模型 JSON；回复被 max_tokens 截断时从残缺文本里取数值字段。
+
+    返回 (data, truncated)。一个数值字段都取不到时抛 ValueError。
+    """
+    try:
+        return _extract_json(text), False
+    except (ValueError, json.JSONDecodeError):
+        pass
+    data = {}
+    for key in ("epochs", "learning_rate"):
+        match = re.search(_NUMBER_FIELD.format(key), text or "")
+        if match:
+            data[key] = float(match.group(1))
+    if not data:
+        raise ValueError("模型回复没有可解析的数值字段")
+    return data, True
 
 
 def _finite_number(value):
@@ -63,6 +90,31 @@ def _history_metrics(record):
     if isinstance(config, dict) and isinstance(config.get("platform_metrics"), dict):
         return {str(k): v for k, v in config["platform_metrics"].items()
                 if _finite_number(v)}
+    return {}
+
+
+def _finite_metrics(value):
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in value.items() if _finite_number(v)}
+
+
+def _selected_history_metrics(record):
+    """该轮最终选中产物的指标；保留父模型时不能用被拒候选的指标。"""
+    if not isinstance(record, dict):
+        return {}
+    config = record.get("configuration")
+    config = config if isinstance(config, dict) else {}
+    metrics = _finite_metrics(config.get("selected_platform_metrics"))
+    if metrics:
+        return metrics
+    metrics = _summary_metrics(record)
+    if metrics:
+        return metrics
+    if record.get("selected_artifact_id") == config.get("parent_artifact_id"):
+        return _finite_metrics(config.get("parent_platform_metrics"))
+    if config.get("selected_source") in (None, "candidate"):
+        return _finite_metrics(config.get("platform_metrics"))
     return {}
 
 
@@ -152,25 +204,47 @@ def _select_from_platform(*, task, metric, direction, candidate, parent,
     return True, {**detail, "reason": "candidate_better"}
 
 
-def _history_prompt(history, include_all=False):
+def _history_prompt(history, include_all=False, metric=None):
     lines = []
     records = history if include_all else history[-3:]
     for record in records:
         config = record.get("configuration") if isinstance(record, dict) else {}
         config = config if isinstance(config, dict) else {}
+        hidden_like = config.get("local_hidden_like")
+        hidden_like = hidden_like if isinstance(hidden_like, dict) else {}
+        label = "platform_metrics"
         metrics = _history_metrics(record)
+        if _finite_metrics(hidden_like.get("candidate")):
+            label, metrics = "hidden_like_metrics", _finite_metrics(hidden_like["candidate"])
+        if metric is not None:
+            metrics = {k: round(v, 6) for k, v in metrics.items()
+                       if _metric_value({k: v}, metric) is not None or "nasa" in k.lower()}
         drift = config.get("platform_drift")
         drift = drift if isinstance(drift, dict) else {}
+        gain = drift.get("relative_gain", "?")
+        gain = round(gain, 4) if _finite_number(gain) else gain
+        adopted = config.get("selected_source", "?")
         lines.append(
             f"  轮{record.get('round_index', '?')}: "
-            f"platform_metrics={json.dumps(metrics, ensure_ascii=False)}; "
+            f"{label}={json.dumps(metrics, ensure_ascii=False)}; "
             f"epochs={config.get('epochs', '?')}; lr={config.get('learning_rate', '?')}; "
-            f"selected={record.get('selected_artifact_id', '?')}; "
+            f"selected={adopted}; "
             f"drift={drift.get('status', 'UNKNOWN')}/"
-            f"{drift.get('reason', 'missing')}/"
-            f"{drift.get('relative_gain', '?')}"
+            f"{drift.get('reason', 'missing')}/{gain}"
         )
     return "\n".join(lines) if lines else "  （暂无历史）"
+
+
+def _tried_learning_rates(history, parent_artifact_id):
+    rates = []
+    for record in history:
+        config = record.get("configuration") if isinstance(record, dict) else None
+        if (isinstance(config, dict)
+                and config.get("parent_artifact_id") == parent_artifact_id
+                and _finite_number(config.get("learning_rate"))
+                and config["learning_rate"] not in rates):
+            rates.append(config["learning_rate"])
+    return rates
 
 
 def _loop_evidence(history, model_call_ids, hypothesis, experiment_status,
@@ -220,12 +294,16 @@ def _complete_sdk_loop_count(history):
 
 
 def _should_skip_training(history, parent_artifact_id, dataset_key=None):
-    if str(dataset_key).upper() == "C":
-        return False
+    """同一父模型连续两轮训练都被拒时，跳过一次工业训练以节省资源。
+
+    跳过轮不能连续出现；HARMFUL 漂移通常不跳过，但 C 在 HARMFUL 之后
+    又被拒一轮，说明该父模型附近已无安全增益，也视为停滞。
+    """
     if _complete_sdk_loop_count(history) < 3 or len(history) < 2:
         return False
     recent = history[-2:]
-    for record in recent:
+    c_profile = str(dataset_key).upper() == "C"
+    for position, record in enumerate(recent):
         config = record.get("configuration") if isinstance(record, dict) else None
         if (not isinstance(config, dict)
                 or config.get("parent_artifact_id") != parent_artifact_id
@@ -235,7 +313,10 @@ def _should_skip_training(history, parent_artifact_id, dataset_key=None):
         drift = config.get("platform_drift")
         if (not isinstance(decision, dict)
                 or decision.get("reason") in ("candidate_better", "first_round_valid_candidate")
-                or not isinstance(drift, dict) or drift.get("status") == "HARMFUL"):
+                or not isinstance(drift, dict)):
+            return False
+        harmful_allowed = c_profile and position == 0
+        if drift.get("status") == "HARMFUL" and not harmful_allowed:
             return False
     return True
 
@@ -248,7 +329,7 @@ def _parent_metrics(rnd, history):
     parent_id = getattr(getattr(rnd, "parent", None), "artifact_id", None)
     for record in reversed(history):
         if record.get("selected_artifact_id") == parent_id:
-            metrics = _history_metrics(record)
+            metrics = _selected_history_metrics(record)
             if metrics:
                 return metrics
     task_contract = getattr(rnd, "task", {})
@@ -258,7 +339,7 @@ def _parent_metrics(rnd, history):
             if metrics:
                 return metrics
     for record in reversed(history):
-        metrics = _history_metrics(record)
+        metrics = _selected_history_metrics(record)
         if metrics:
             return metrics
     return {}
@@ -275,7 +356,7 @@ def _best_allowed_history(history, artifacts, metric, direction, parent_metrics,
         artifact_id = record.get("selected_artifact_id")
         if artifact_id not in allowed:
             continue
-        metrics = _history_metrics(record)
+        metrics = _selected_history_metrics(record)
         eligible, _ = _select_from_platform(
             task="", metric=metric, direction=direction,
             candidate=metrics, parent=parent_metrics, first_round=False,
@@ -347,6 +428,9 @@ def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
         return 1, lr, False, "C_platform_search:单步续训便于平台反馈归因"
     if profile == "A" and round_index in (1, 2):
         return 10, 0.01, False, "A_early_round:前两轮采用已验证的强起点"
+    if profile == "A" and epochs > A_MAX_EPOCHS:
+        return (A_MAX_EPOCHS, lr, False,
+                f"A_epoch_cap:限制续训不超过{A_MAX_EPOCHS}轮，避免对公开验证集过拟合")
     if profile == "B":
         if round_index == 1:
             return 10, 0.001, False, "B_first_submission_start:恢复首次提交的安全起点"
@@ -399,28 +483,37 @@ def _ask_model(rnd, task, metric, history):
     hib = rnd.task.get("metric_direction", "higher" if task == "classification" else "lower") == "higher"
     direction = "越大越好" if hib else "越小越好"
     c_search = str(rnd.dataset_key).upper() == "C"
-    hist = _history_prompt(history, include_all=c_search)
-    request = ('{"learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}'
+    hist = _history_prompt(history, metric=metric)
+    if c_search:
+        tried = _tried_learning_rates(history, rnd.parent.artifact_id)
+        hist += f"\n  当前父模型下已试过的 lr：{tried if tried else '无'}"
+        hist += "\n  （hidden_like_metrics 指 RUL≤上限 的验证样本，接近隐藏测试分布，是 C 的上线依据）"
+    epoch_max = A_MAX_EPOCHS if str(rnd.dataset_key).upper() == "A" else EPOCH_RANGE[1]
+    request = ('{"learning_rate": 0到0.1小数, "hypothesis": "不超过30字"}'
                if c_search else
-               '{"epochs": 整数1-50, "learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}')
+               f'{{"epochs": 整数1-{epoch_max}, "learning_rate": 0到0.1小数, '
+               f'"hypothesis": "不超过30字"}}')
     user = (
         f"数据集 {rnd.dataset_key}，任务 {task}，主指标 {metric}（{direction}）。\n"
-        f"本轮从父检查点续训，梯度只用公开训练集。历史检查点表现：\n{hist}\n\n"
-        f"请给出本轮续训超参，严格只输出 JSON：{request}"
+        f"本轮从父检查点续训，梯度只用公开训练集。最近历史（selected=本轮最终选用来源）：\n{hist}\n\n"
+        f"请给出本轮续训超参，严格只输出 JSON，数值字段在前：{request}"
     )
     epochs, lr = (1, 0.001) if c_search else (5, None)
     hypothesis = "回退官方默认超参续训一轮"
     receipt = rnd.model(
         [{"role": "user", "content": user}],
-        max_tokens=min(96, rnd.max_output_tokens), temperature=0,
+        max_tokens=min(MODEL_MAX_TOKENS, rnd.max_output_tokens), temperature=0,
         enable_thinking=False,
         response_format={"type": "json_object"})
     try:
-        data = _extract_json(receipt.text)
-        if not c_search:
-            epochs = int(_clamp(int(data["epochs"]), *EPOCH_RANGE))
-        lr = float(_clamp(float(data["learning_rate"]), *LR_RANGE))
-        if isinstance(data.get("hypothesis"), str) and data["hypothesis"].strip():
+        data, truncated = _parse_model_reply(receipt.text)
+        if not c_search and "epochs" in data:
+            epochs = int(_clamp(int(data["epochs"]), EPOCH_RANGE[0], epoch_max))
+        if "learning_rate" in data:
+            lr = float(_clamp(float(data["learning_rate"]), *LR_RANGE))
+        if truncated:
+            hypothesis = "模型回复被截断，已解析数值字段"
+        elif isinstance(data.get("hypothesis"), str) and data["hypothesis"].strip():
             hypothesis = data["hypothesis"].strip()[:2000]
     except Exception as exc:  # noqa: BLE001 —— 慢通路失败回退，不中断本轮
         hypothesis = f"模型回复不可用（{type(exc).__name__}），回退官方默认超参"
@@ -469,6 +562,59 @@ def _decide_promote(rnd, task, parent_ckpt, cand_ckpt, report):
     return _aggregate_better(task, before, after), {"fallback": "aggregate", **info}
 
 
+def _proxy_parent_metrics(metric, parent_metrics, candidate_metrics, report):
+    """平台缺父模型值时，用父检查点在同一公开验证集上的本地指标作代理。
+
+    仅当本地候选指标与平台候选指标口径一致（相对差 ≤ PROXY_TOLERANCE）时启用。
+    """
+    if _metric_value(parent_metrics, metric) is not None:
+        return parent_metrics, "platform"
+    before = _finite_metrics(report.get("validation_before"))
+    local_cand = _metric_value(_finite_metrics(report.get("validation_after")), metric)
+    platform_cand = _metric_value(candidate_metrics, metric)
+    if _metric_value(before, metric) is None or local_cand is None or platform_cand is None:
+        return parent_metrics, "missing"
+    if abs(local_cand - platform_cand) > PROXY_TOLERANCE * max(abs(platform_cand), 1e-12):
+        return parent_metrics, "proxy_rejected:metric_mismatch"
+    return before, "local_validation_before"
+
+
+def _hidden_like_metrics(report):
+    """训练报告里父模型与候选在类隐藏集上的指标；缺任一侧返回 None。"""
+    parent = _finite_metrics(report.get("validation_before_hidden_like"))
+    candidate = _finite_metrics(report.get("validation_after_hidden_like"))
+    if not parent or not candidate:
+        return None
+    return {"parent": parent, "candidate": candidate,
+            "max_target": report.get("hidden_like_max"),
+            "rows": report.get("hidden_like_rows")}
+
+
+def _select_c_hidden_like(metric, direction, hidden_like, candidate_platform,
+                          parent_platform):
+    """C：类隐藏集主指标更好且 NASA 不明显变差；平台完整公开集只作护栏。"""
+    promote, detail = _select_from_platform(
+        task="regression", metric=metric, direction=direction,
+        candidate=hidden_like["candidate"], parent=hidden_like["parent"],
+        first_round=False, dataset_key="C")
+    detail = {**detail, "source": "local_hidden_like"}
+    cand_public = _metric_value(candidate_platform, metric)
+    prev_public = _metric_value(parent_platform, metric)
+    guard = {"metric": metric, "candidate": cand_public, "parent": prev_public,
+             "tolerance": C_PUBLIC_GUARD_TOLERANCE}
+    if cand_public is None:
+        return False, {**detail, "reason": "candidate_metric_missing", "public_guard": guard}
+    if prev_public is None:
+        return promote, {**detail, "public_guard": {**guard, "status": "unavailable"}}
+    worse = (prev_public - cand_public if direction == "higher"
+             else cand_public - prev_public) / max(abs(prev_public), 1e-12)
+    guard = {**guard, "relative_degradation": worse}
+    if promote and worse > C_PUBLIC_GUARD_TOLERANCE:
+        return False, {**detail, "reason": "public_guard",
+                       "public_guard": {**guard, "status": "blocked"}}
+    return promote, {**detail, "public_guard": {**guard, "status": "passed"}}
+
+
 def train(rnd):
     task = rnd.task["task"]
     metric = rnd.task.get("metric", "macro_f1" if task == "classification" else "rmse")
@@ -482,7 +628,7 @@ def train(rnd):
     if _should_skip_training(
             history, rnd.parent.artifact_id, dataset_key=rnd.dataset_key):
         parent_metrics = _parent_metrics(rnd, history)
-        change = "连续两轮无改善且无有害漂移，本轮跳过工业训练"
+        change = "同一父模型连续两轮无改善，本轮跳过工业训练"
         reason = f"资源策略：保留父模型并跳过一次训练；模型建议调用 {call_id}。"
         loop_evidence = _loop_evidence(
             history, rnd.call_ids, hypothesis, "training_skipped", "resource_policy")
@@ -564,9 +710,12 @@ def train(rnd):
     report = json.loads((cand / "training.json").read_text())
     after = report.get("validation_after", {})
 
-    # 本地配对检验只作诊断；上线选择严格以平台 submit_candidate 返回摘要为准。
-    _, local_diagnostic = _decide_promote(
-        rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
+    # 本地指标只作诊断，直接取训练报告，不再加载模型做 bootstrap（省 CPU）。
+    local_diagnostic = {"source": "training_report",
+                        "validation_before": report.get("validation_before", {}),
+                        "validation_after": after,
+                        "early_stopped": report.get("early_stopped"),
+                        "training_seconds": report.get("training_seconds")}
     change = f"从父检查点续训 epochs={epochs} lr={lr if lr is not None else '默认'}"
     seed = int(report.get("seed", 42))
     configuration = {"epochs": epochs, "learning_rate": lr, "model_call_id": call_id,
@@ -584,13 +733,26 @@ def train(rnd):
 
     candidate_metrics = _summary_metrics({"summary": submitted.get("summary")})
     parent_metrics = _parent_metrics(rnd, history)
-    platform_drift = _platform_metric_drift(
-        metric, direction, candidate_metrics, parent_metrics,
-        dataset_key=rnd.dataset_key)
-    promote, platform_decision = _select_from_platform(
-        task=task, metric=metric, direction=direction,
-        candidate=candidate_metrics, parent=parent_metrics,
-        first_round=rnd.round_index == 1, dataset_key=rnd.dataset_key)
+    parent_metrics, parent_metric_source = _proxy_parent_metrics(
+        metric, parent_metrics, candidate_metrics, report)
+    hidden_like = _hidden_like_metrics(report)
+    use_hidden_like = str(rnd.dataset_key).upper() == "C" and hidden_like is not None
+    if use_hidden_like:
+        platform_drift = {
+            **_platform_metric_drift(
+                metric, direction, hidden_like["candidate"], hidden_like["parent"],
+                dataset_key=rnd.dataset_key),
+            "basis": "local_hidden_like"}
+        promote, platform_decision = _select_c_hidden_like(
+            metric, direction, hidden_like, candidate_metrics, parent_metrics)
+    else:
+        platform_drift = _platform_metric_drift(
+            metric, direction, candidate_metrics, parent_metrics,
+            dataset_key=rnd.dataset_key)
+        promote, platform_decision = _select_from_platform(
+            task=task, metric=metric, direction=direction,
+            candidate=candidate_metrics, parent=parent_metrics,
+            first_round=rnd.round_index == 1, dataset_key=rnd.dataset_key)
     if promote:
         selected, selected_metrics = submitted["artifact_id"], candidate_metrics
         verdict, selected_source = "采纳候选", "candidate"
@@ -598,7 +760,8 @@ def train(rnd):
         selected, selected_metrics = rnd.parent.artifact_id, parent_metrics
         verdict, selected_source = "保留父模型", "parent"
     selected_history_id = None
-    history_best = _best_allowed_history(
+    # C 按类隐藏集单调推进；历史里只有完整公开集指标，按它恢复会选回未截断的旧模型。
+    history_best = None if use_hidden_like else _best_allowed_history(
         history, getattr(rnd, "artifacts", []), metric, direction,
         parent_metrics, dataset_key=rnd.dataset_key)
     if history_best is not None:
@@ -615,18 +778,23 @@ def train(rnd):
         **configuration,
         "platform_metrics": candidate_metrics,
         "parent_platform_metrics": parent_metrics,
+        "parent_metric_source": parent_metric_source,
         "platform_decision": platform_decision,
         "selected_source": selected_source,
         "selected_history_id": selected_history_id,
         "selected_platform_metrics": selected_metrics,
         "platform_drift": platform_drift,
     }
+    if use_hidden_like:
+        finish_configuration["local_hidden_like"] = {
+            **hidden_like, "decision_source": "local_hidden_like"}
     loop_evidence = _loop_evidence(
         history, rnd.call_ids, hypothesis, "candidate_measured", "platform_summary")
     finish_configuration["loop_evidence"] = loop_evidence
     finish_configuration["complete_loops_total"] = (
         _complete_sdk_loop_count(history) + int(loop_evidence["complete"]))
-    reason = (f"平台摘要判定：{verdict}。模型建议调用 {call_id}；"
+    basis = "类隐藏集（RUL≤上限）本地判定，平台公开集作护栏" if use_hidden_like else "平台摘要判定"
+    reason = (f"{basis}：{verdict}。模型建议调用 {call_id}；"
               f"平台候选指标={json.dumps(candidate_metrics, ensure_ascii=False)}；"
               f"平台父模型指标={json.dumps(parent_metrics, ensure_ascii=False)}；"
               f"判定={json.dumps(platform_decision, ensure_ascii=False)}；"

@@ -220,6 +220,40 @@ def test_history_prompt_defaults_to_latest_three_but_can_include_all_rounds():
     assert all(f"轮{i}:" in full_prompt for i in range(1, 6))
 
 
+def test_parse_model_reply_recovers_numbers_from_truncated_json():
+    data, truncated = cs._parse_model_reply(
+        '{"epochs": 12, "learning_rate": 0.0008, "hypothesis": "学习率减半以')
+    assert truncated is True
+    assert data == {"epochs": 12.0, "learning_rate": 0.0008}
+    data, truncated = cs._parse_model_reply('{"learning_rate": 1e-4}')
+    assert truncated is False and data["learning_rate"] == 1e-4
+    with pytest.raises(ValueError):
+        cs._parse_model_reply('{"hypothesis": "没有数字')
+
+
+def test_ask_model_uses_truncated_reply_numbers_and_compact_c_prompt():
+    history = [{
+        "id": f"r{i}", "round_index": i, "selected_artifact_id": "parent-1",
+        "configuration": {
+            "parent_artifact_id": "parent-1", "learning_rate": 0.0001 * i,
+            "selected_source": "parent",
+            "platform_metrics": {"rmse": 50.0 + i, "mae": 40.0,
+                                 "nasa_asymmetric_score": 9.0},
+        },
+    } for i in range(1, 6)]
+    rnd = _Round(history, {}, round_index=6)
+    rnd.dataset_key = "C"
+    rnd.task = {"task": "regression", "metric": "rmse", "metric_direction": "lower"}
+    rnd.reply = '{"learning_rate": 0.00033, "hypothesis": "截'
+    epochs, lr, _, hypothesis, _ = cs._ask_model(rnd, "regression", "rmse", history)
+    assert (epochs, lr) == (1, 0.00033)
+    assert "截断" in hypothesis
+    prompt = rnd.prompts[0]
+    assert "轮1:" not in prompt and "轮5:" in prompt
+    assert '"mae"' not in prompt and "nasa_asymmetric_score" in prompt
+    assert "已试过的 lr" in prompt and "0.0001" in prompt
+
+
 def test_first_round_loop_evidence_is_complete_with_empty_history():
     evidence = cs._loop_evidence(
         [], ["call-1"], "首轮假设", "candidate_measured", "platform_summary")
@@ -259,7 +293,7 @@ def test_resource_skip_requires_three_loops_two_rejections_and_no_harmful_drift(
     assert cs._should_skip_training(history, "parent-1") is False
 
 
-def test_c_resource_policy_never_skips_a_platform_round():
+def test_c_resource_policy_skips_after_two_stable_rejections():
     history = [{
         "id": f"r{i}", "selected_artifact_id": "parent-c",
         "configuration": {
@@ -270,7 +304,24 @@ def test_c_resource_policy_never_skips_a_platform_round():
         },
     } for i in range(1, 4)]
     assert cs._should_skip_training(
-        history, "parent-c", dataset_key="C") is False
+        history, "parent-c", dataset_key="C") is True
+
+
+def test_c_skips_when_harmful_round_is_followed_by_another_rejection():
+    history = [{
+        "id": f"r{i}", "selected_artifact_id": "parent-c",
+        "configuration": {
+            "parent_artifact_id": "parent-c",
+            "loop_evidence": {"complete": True},
+            "platform_decision": {"reason": "nasa_stability_veto"},
+            "platform_drift": {"status": "STABLE"},
+        },
+    } for i in range(1, 4)]
+    history[-2]["configuration"]["platform_drift"] = {"status": "HARMFUL"}
+    assert cs._should_skip_training(history, "parent-c", dataset_key="C") is True
+    assert cs._should_skip_training(history, "parent-c", dataset_key="B") is False
+    history[-1]["configuration"]["platform_drift"] = {"status": "HARMFUL"}
+    assert cs._should_skip_training(history, "parent-c", dataset_key="C") is False
 
 
 def test_parent_metrics_prefers_matching_parent_artifact():
@@ -282,6 +333,49 @@ def test_parent_metrics_prefers_matching_parent_artifact():
         "artifact_id": "parent-1", "receipt": {"artifact_id": "parent-1"}
     })()})()
     assert cs._parent_metrics(rnd, history) == {"rmse": 9.5}
+
+
+def test_parent_metrics_ignores_rejected_candidate_of_kept_parent_round():
+    history = [
+        {"id": "r1", "selected_artifact_id": "parent-1",
+         "configuration": {"parent_artifact_id": "base",
+                           "selected_source": "candidate",
+                           "platform_metrics": {"rmse": 51.816}}},
+        {"id": "r2", "selected_artifact_id": "parent-1",
+         "configuration": {"parent_artifact_id": "parent-1",
+                           "selected_source": "parent",
+                           "platform_metrics": {"rmse": 51.868},
+                           "parent_platform_metrics": {"rmse": 51.816},
+                           "selected_platform_metrics": {"rmse": 51.816}}},
+    ]
+    rnd = type("R", (), {"parent": type("P", (), {
+        "artifact_id": "parent-1", "receipt": {"artifact_id": "parent-1"}
+    })()})()
+    assert cs._parent_metrics(rnd, history) == {"rmse": 51.816}
+
+
+def test_selected_history_metrics_without_selected_field_uses_parent_metrics():
+    record = {"selected_artifact_id": "parent-1",
+              "configuration": {"parent_artifact_id": "parent-1",
+                                "platform_metrics": {"rmse": 9.0},
+                                "parent_platform_metrics": {"rmse": 10.0}}}
+    assert cs._selected_history_metrics(record) == {"rmse": 10.0}
+    old_format = {"selected_artifact_id": "x",
+                  "configuration": {"platform_metrics": {"rmse": 9.7}}}
+    assert cs._selected_history_metrics(old_format) == {"rmse": 9.7}
+
+
+def test_best_history_uses_selected_metrics_not_rejected_candidate():
+    history = [{
+        "id": "r1", "selected_artifact_id": "parent-1",
+        "configuration": {"parent_artifact_id": "parent-1",
+                          "selected_source": "parent",
+                          "platform_metrics": {"rmse": 5.0},
+                          "selected_platform_metrics": {"rmse": 10.0}},
+    }]
+    assert cs._best_allowed_history(
+        history, [{"artifact_id": "parent-1"}], "rmse", "lower",
+        {"rmse": 9.0}, dataset_key="B") is None
 
 
 def test_parent_metrics_uses_task_contract_before_unmatched_history():
@@ -334,6 +428,40 @@ def test_a_early_round_strategy_uses_strong_known_start(round_index):
 def test_a_third_round_keeps_qwen_proposal():
     assert cs._apply_profile_strategy(
         "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, False, "")
+
+
+def test_a_late_round_caps_epochs_to_limit_overfitting():
+    epochs, lr, reset, reason = cs._apply_profile_strategy(
+        "A", 7, 40, 0.0008, [], "parent-a")
+    assert (epochs, lr, reset) == (cs.A_MAX_EPOCHS, 0.0008, False)
+    assert reason.startswith("A_epoch_cap")
+
+
+def test_ask_model_clamps_a_epochs_before_repeat_check():
+    rnd = _Round([], {}, round_index=5)
+    rnd.reply = '{"epochs": 40, "learning_rate": 0.001, "hypothesis": "加长训练"}'
+    epochs, lr, _, _, _ = cs._ask_model(rnd, "classification", "macro_f1", [])
+    assert epochs == cs.A_MAX_EPOCHS and lr == 0.001
+    assert f"整数1-{cs.A_MAX_EPOCHS}" in rnd.prompts[0]
+
+
+def test_a_skips_after_three_loops_and_two_stable_rejections_then_resumes():
+    record = {
+        "configuration": {
+            "parent_artifact_id": "parent-a",
+            "platform_decision": {"reason": "candidate_not_better"},
+            "platform_drift": {"status": "STABLE"},
+            "loop_evidence": {"complete": True},
+        }
+    }
+    assert cs._should_skip_training([record] * 2, "parent-a", dataset_key="A") is False
+    assert cs._should_skip_training([record] * 3, "parent-a", dataset_key="A") is True
+    skipped = {"configuration": {**record["configuration"],
+                                 "resource_action": "training_skipped"}}
+    assert cs._should_skip_training(
+        [record] * 3 + [skipped], "parent-a", dataset_key="A") is False
+    assert cs._should_skip_training(
+        [record] * 3 + [skipped, record], "parent-a", dataset_key="A") is False
 
 
 def test_c_first_round_restores_first_submission_safe_start():
@@ -505,6 +633,8 @@ class _Round:
         self.parent = _Parent()
         self.data = _Data()
         self.call_ids = []
+        self.prompts = []
+        self.reply = '{"epochs": 2, "learning_rate": 0.003, "hypothesis": "test"}'
         self._history = history
         self._summary = summary
         self.artifacts = artifacts or []
@@ -516,12 +646,13 @@ class _Round:
 
     def model(self, messages, **options):
         assert options["response_format"] == {"type": "json_object"}
-        assert options["max_tokens"] <= 96
+        assert options["max_tokens"] <= cs.MODEL_MAX_TOKENS
+        self.prompts.append(messages[0]["content"])
         assert options["enable_thinking"] is False
         self.call_ids.append("call-1")
         return type("Receipt", (), {
             "call_id": "call-1",
-            "text": '{"epochs": 2, "learning_rate": 0.003, "hypothesis": "test"}',
+            "text": self.reply,
         })()
 
     def submit_candidate(self, directory, **kwargs):
@@ -549,6 +680,162 @@ def _fake_training(monkeypatch, tmp_path, local_promote):
     monkeypatch.setattr(cs, "_decide_promote", lambda *a, **k: (local_promote, {"p": 1.0}))
 
 
+def _fake_training_report(monkeypatch, tmp_path, before, after):
+    def run(*args, **kwargs):
+        cand = tmp_path / "cand"
+        cand.mkdir()
+        (cand / "checkpoint.npz").write_bytes(b"checkpoint")
+        (cand / "training.json").write_text(json.dumps({
+            "seed": 42, "validation_before": before, "validation_after": after,
+        }), encoding="utf-8")
+        return type("Proc", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
+    monkeypatch.setattr(cs.subprocess, "run", run)
+
+
+def test_first_round_keeps_baseline_when_candidate_worse_than_local_proxy(
+        monkeypatch, tmp_path):
+    rnd = _Round([], {"macro_f1": 0.7264, "accuracy": 0.885}, round_index=1)
+    _fake_training_report(monkeypatch, tmp_path,
+                          {"macro_f1": 0.80, "accuracy": 0.90},
+                          {"macro_f1": 0.7264, "accuracy": 0.885})
+    cs.train(rnd)
+    config = rnd.finished["configuration"]
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert config["parent_metric_source"] == "local_validation_before"
+    assert config["platform_decision"]["reason"] == "candidate_not_better"
+
+
+def test_first_round_proxy_rejected_when_local_and_platform_metrics_disagree(
+        monkeypatch, tmp_path):
+    rnd = _Round([], {"macro_f1": 0.70}, round_index=1)
+    _fake_training_report(monkeypatch, tmp_path,
+                          {"macro_f1": 0.80}, {"macro_f1": 0.90})
+    cs.train(rnd)
+    config = rnd.finished["configuration"]
+    assert rnd.finished["selected_artifact_id"] == "candidate-1"
+    assert config["parent_metric_source"] == "proxy_rejected:metric_mismatch"
+    assert config["platform_decision"]["reason"] == "first_round_valid_candidate"
+
+
+def _c_round(tmp_path, monkeypatch, *, platform_candidate, report_extra,
+             history=None, artifacts=None, round_index=4):
+    history = history if history is not None else [{
+        "id": "r1", "round_index": 1, "selected_artifact_id": "parent-1",
+        "configuration": {"parent_artifact_id": "base", "selected_source": "candidate",
+                          "selected_platform_metrics": {
+                              "rmse": 52.0, "nasa_asymmetric_score": 100.0}},
+    }]
+    rnd = _Round(history, platform_candidate, round_index=round_index,
+                 artifacts=artifacts)
+    rnd.dataset_key = "C"
+    rnd.task = {"task": "regression", "metric": "rmse", "metric_direction": "lower"}
+    rnd.reply = '{"learning_rate": 0.0004, "hypothesis": "小步"}'
+
+    def run(cmd, **kwargs):
+        cand = tmp_path / "cand"
+        cand.mkdir()
+        (cand / "checkpoint.npz").write_bytes(b"checkpoint")
+        (cand / "training.json").write_text(json.dumps({
+            "seed": 42, "validation_before": {"rmse": 52.0},
+            "validation_after": platform_candidate, **report_extra,
+        }), encoding="utf-8")
+        return type("Proc", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
+    monkeypatch.setattr(cs.subprocess, "run", run)
+    cs.train(rnd)
+    return rnd
+
+
+_HIDDEN_BETTER = {
+    "hidden_like_max": 200, "hidden_like_rows": 100,
+    "validation_before_hidden_like": {"rmse": 38.0, "nasa_asymmetric_score": 1e8},
+    "validation_after_hidden_like": {"rmse": 34.0, "nasa_asymmetric_score": 1e7},
+}
+
+
+def test_c_adopts_hidden_like_gain_despite_small_public_degradation(monkeypatch, tmp_path):
+    rnd = _c_round(tmp_path, monkeypatch,
+                   platform_candidate={"rmse": 53.456, "nasa_asymmetric_score": 900.0},
+                   report_extra=_HIDDEN_BETTER)
+    config = rnd.finished["configuration"]
+    assert rnd.finished["selected_artifact_id"] == "candidate-1"
+    assert config["platform_decision"]["source"] == "local_hidden_like"
+    assert config["platform_decision"]["public_guard"]["status"] == "passed"
+    assert config["local_hidden_like"]["decision_source"] == "local_hidden_like"
+    assert config["platform_drift"]["basis"] == "local_hidden_like"
+    assert config["platform_drift"]["status"] == "IMPROVED"
+    assert rnd.finished["reason"].startswith("类隐藏集")
+
+
+def test_c_public_guard_blocks_large_public_degradation(monkeypatch, tmp_path):
+    rnd = _c_round(tmp_path, monkeypatch,
+                   platform_candidate={"rmse": 55.0, "nasa_asymmetric_score": 90.0},
+                   report_extra=_HIDDEN_BETTER)
+    decision = rnd.finished["configuration"]["platform_decision"]
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert decision["reason"] == "public_guard"
+    assert decision["public_guard"]["status"] == "blocked"
+
+
+def test_c_rejects_hidden_like_nasa_worsening(monkeypatch, tmp_path):
+    extra = {**_HIDDEN_BETTER, "validation_after_hidden_like": {
+        "rmse": 34.0, "nasa_asymmetric_score": 2e8}}
+    rnd = _c_round(tmp_path, monkeypatch,
+                   platform_candidate={"rmse": 51.0, "nasa_asymmetric_score": 90.0},
+                   report_extra=extra)
+    config = rnd.finished["configuration"]
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert config["platform_decision"]["reason"] == "nasa_stability_veto"
+    assert config["platform_drift"]["status"] == "HARMFUL"
+
+
+def test_c_hidden_like_path_never_restores_history(monkeypatch, tmp_path):
+    history = [
+        {"id": "r1", "round_index": 1, "selected_artifact_id": "old-best",
+         "configuration": {"parent_artifact_id": "base", "selected_source": "candidate",
+                           "selected_platform_metrics": {
+                               "rmse": 40.0, "nasa_asymmetric_score": 1.0}}},
+        {"id": "r2", "round_index": 2, "selected_artifact_id": "parent-1",
+         "configuration": {"parent_artifact_id": "old-best", "selected_source": "candidate",
+                           "selected_platform_metrics": {
+                               "rmse": 52.0, "nasa_asymmetric_score": 100.0}}},
+    ]
+    worse = {**_HIDDEN_BETTER, "validation_after_hidden_like": {
+        "rmse": 39.0, "nasa_asymmetric_score": 1e8}}
+    rnd = _c_round(tmp_path, monkeypatch,
+                   platform_candidate={"rmse": 52.5, "nasa_asymmetric_score": 100.0},
+                   report_extra=worse, history=history,
+                   artifacts=[{"artifact_id": "old-best"}, {"artifact_id": "parent-1"}])
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert rnd.finished["configuration"]["selected_source"] == "parent"
+
+
+def test_c_history_prompt_prefers_hidden_like_metrics():
+    history = [{"round_index": 1, "configuration": {
+        "platform_metrics": {"rmse": 52.0},
+        "local_hidden_like": {"candidate": {"rmse": 34.0, "nasa_asymmetric_score": 9.0}},
+    }}]
+    prompt = cs._history_prompt(history, metric="rmse")
+    assert 'hidden_like_metrics={"rmse": 34.0' in prompt
+    assert "52.0" not in prompt
+
+
+def test_a_ignores_hidden_like_fields_and_uses_platform(monkeypatch, tmp_path):
+    history = [{
+        "id": "r1", "selected_artifact_id": "parent-1",
+        "summary": {"metrics": {"macro_f1": 0.80}},
+        "configuration": {"epochs": 5, "learning_rate": 0.001},
+    }]
+    rnd = _Round(history, {"macro_f1": 0.79})
+    _fake_training(monkeypatch, tmp_path, local_promote=True)
+    cs.train(rnd)
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert "local_hidden_like" not in rnd.finished["configuration"]
+
+
 def test_train_rejects_platform_regression_even_if_local_gate_promotes(monkeypatch, tmp_path):
     history = [{
         "id": "r1", "selected_artifact_id": "parent-1",
@@ -573,7 +860,12 @@ def test_train_promotes_platform_improvement_even_if_local_gate_rejects(monkeypa
     _fake_training(monkeypatch, tmp_path, local_promote=False)
     cs.train(rnd)
     assert rnd.finished["selected_artifact_id"] == "candidate-1"
-    assert rnd.finished["configuration"]["local_diagnostic"] == {"p": 1.0}
+    assert rnd.finished["configuration"]["local_diagnostic"] == {
+        "source": "training_report",
+        "validation_before": {"macro_f1": 0.70},
+        "validation_after": {"macro_f1": 0.99},
+        "early_stopped": None, "training_seconds": None,
+    }
     assert rnd.finished["configuration"]["loop_evidence"]["complete"] is True
     assert (rnd.finished["configuration"]["loop_evidence"]["experiment_status"]
             == "candidate_measured")
@@ -639,6 +931,7 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
             },
         })
     rnd = _Round(history, {"macro_f1": 0.81}, round_index=4)
+    rnd.dataset_key = "B"
     monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
     monkeypatch.setattr(
         cs.subprocess, "run",
@@ -657,7 +950,7 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
     assert report["candidate_count"] == 0
 
 
-def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
+def test_train_c_uses_one_epoch_and_trains_after_recent_improvement(monkeypatch, tmp_path):
     history = [{
         "id": f"r{i}", "round_index": i,
         "selected_artifact_id": "parent-1",
@@ -667,7 +960,8 @@ def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
             "parent_artifact_id": "parent-1", "epochs": 5,
             "learning_rate": 0.001,
             "loop_evidence": {"complete": True},
-            "platform_decision": {"reason": "candidate_not_better"},
+            "platform_decision": {
+                "reason": "candidate_better" if i == 3 else "candidate_not_better"},
             "platform_drift": {"status": "STABLE"},
         },
     } for i in range(1, 4)]
@@ -694,7 +988,8 @@ def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
     monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
     monkeypatch.setattr(cs.subprocess, "run", run)
     monkeypatch.setattr(
-        cs, "_decide_promote", lambda *a, **k: (True, {"p": 1.0}))
+        cs, "_decide_promote",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bootstrap removed")))
     cs.train(rnd)
 
     index = seen["cmd"].index("--epochs")

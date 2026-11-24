@@ -20,7 +20,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 C_NASA_TOLERANCE = 0.05
 C_RMSE_TOLERANCE = 0.01
-C_EARLY_STOP_PATIENCE = 3
+EARLY_STOP_PATIENCE = 3
 
 
 def _better_validation(profile, task, current, best):
@@ -46,6 +46,18 @@ def _nasa_score(predicted, expected):
     error = np.asarray(predicted) - np.asarray(expected)
     exponent = np.where(error >= 0, error / 10.0, -error / 13.0)
     return float(np.sum(np.expm1(np.minimum(exponent, 600.0))))
+
+
+def _hidden_like_subset(data, maximum):
+    """只保留真实目标不超过 maximum 的验证样本，近似隐藏测试的 RUL 范围。"""
+    if maximum is None:
+        return None
+    if isinstance(maximum, bool) or not isinstance(maximum, (int, float)) or maximum <= 0:
+        raise ValueError("hidden_like_max must be a positive number")
+    mask = data["y"] <= maximum
+    if not np.any(mask):
+        return None
+    return {"x": data["x"][mask], "y": data["y"][mask]}
 
 
 def _reset_optimizer_moments(model):
@@ -129,6 +141,13 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
         model.meta["target_unit"] = "minutes"
     if config["profile"] == "C" and config["task"] == "regression":
         model.meta["overestimate_weight"] = 1.0
+    hidden_like = _hidden_like_subset(validation, config.get("hidden_like_max"))
+    # 父模型的指标必须在写入截断之前测：它代表线上父模型的真实预测。
+    validation_before = metrics(model, validation)
+    hidden_like_before = metrics(model, hidden_like) if hidden_like else None
+    for name in ("target_cap", "prediction_cap"):
+        if name in config:
+            model.meta[name] = config[name]
     if learning_rate is not None:
         model.meta["learning_rate"] = learning_rate
     if batch_size is not None:
@@ -138,23 +157,29 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
     if type(count) is not int or not 1 <= count <= 10000:
         raise ValueError("epochs must be in 1..10000")
     initial_steps, initial_epochs = model.meta["steps"], model.meta["epochs"]
-    validation_before = metrics(model, validation)
     started = time.monotonic()
     records = []
     best_model, best_validation, stale_epochs = None, None, 0
+    best_selection, best_hidden_like = None, None
     for _ in range(count):
         loss = model.fit(train["x"], train["y"], 1)[0]
         current_validation = metrics(model, validation)
-        records.append({"epoch": model.meta["epochs"], "step": model.meta["steps"], "loss": loss,
-                        "validation": current_validation})
+        current_hidden_like = metrics(model, hidden_like) if hidden_like else None
+        record = {"epoch": model.meta["epochs"], "step": model.meta["steps"], "loss": loss,
+                  "validation": current_validation}
+        if current_hidden_like is not None:
+            record["validation_hidden_like"] = current_hidden_like
+        records.append(record)
+        # 配置了类隐藏集时，最佳 epoch 与早停按类隐藏集指标判断。
+        current_selection = current_hidden_like or current_validation
         if _better_validation(config["profile"], config["task"],
-                              current_validation, best_validation):
+                              current_selection, best_selection):
             best_model, best_validation = copy.deepcopy(model), current_validation
+            best_selection, best_hidden_like = current_selection, current_hidden_like
             stale_epochs = 0
         else:
             stale_epochs += 1
-            if (config["profile"] == "C"
-                    and stale_epochs >= C_EARLY_STOP_PATIENCE):
+            if stale_epochs >= EARLY_STOP_PATIENCE:
                 break
     duration = time.monotonic() - started
     if best_model is None:
@@ -181,12 +206,18 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
                   "training_seconds": duration, "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
                   "validation_before": validation_before, "validation_after": best_validation,
                   "best_validation": best_validation,
+                  "hidden_like_max": config.get("hidden_like_max") if hidden_like else None,
+                  "hidden_like_rows": len(hidden_like["y"]) if hidden_like else 0,
+                  "validation_before_hidden_like": hidden_like_before,
+                  "validation_after_hidden_like": best_hidden_like,
                   "configuration": {"hidden": model.meta["hidden"], "activation": "tanh", "optimizer": "Adam",
                       "adam_beta1": .9, "adam_beta2": .999, "adam_epsilon": 1e-8, "gradient_clip_norm": 5.0,
                       "feature_clip": [-10.0, 10.0], "normalization": "initial_training_mean_std",
                       "learning_rate": model.meta["learning_rate"], "batch_size": model.meta["batch_size"],
                       "requested_epochs": count, "classes": model.meta["classes"],
                        "overestimate_weight": model.meta.get("overestimate_weight", 1.0),
+                       "target_cap": model.meta.get("target_cap"),
+                       "prediction_cap": model.meta.get("prediction_cap"),
                        "optimizer_moments_reset": bool(reset_optimizer_moments)},
                   "source_sha256": {name: sha256((ROOT / name).read_bytes()) for name in ("model.py", "data.py", "train.py", "predict.py")},
                   "label_provenance": provenance, "created_at": datetime.now(timezone.utc).isoformat()}

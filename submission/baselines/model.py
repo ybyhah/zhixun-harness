@@ -78,6 +78,13 @@ class Model:
         if (isinstance(weight, bool) or not isinstance(weight, (float, int))
                 or not math.isfinite(weight) or not 1 <= weight <= 10):
             raise ValueError("invalid overestimate weight")
+        for name in ("target_cap", "prediction_cap"):
+            if name in m:
+                cap = m[name]
+                if (m["task"] != "regression" or isinstance(cap, bool)
+                        or not isinstance(cap, (float, int))
+                        or not math.isfinite(cap) or cap <= 0):
+                    raise ValueError("invalid regression cap")
         input_size, hidden = len(m["paths"]), m["hidden"]
         output = len(classes) if m["task"] == "classification" else 1
         shapes = {"w1": (input_size, hidden), "b1": (hidden,), "w2": (hidden, output), "b2": (output,)}
@@ -110,6 +117,8 @@ class Model:
         if y.shape != (len(x),) or not len(x):
             raise ValueError("target shape mismatch")
         if self.meta["task"] == "regression":
+            if "target_cap" in self.meta:
+                y = np.minimum(y, self.meta["target_cap"])
             target = (y - self.meta["target_mean"]) / self.meta["target_scale"]
         else:
             if np.any(y < 0) or np.any(y >= len(self.meta["classes"])):
@@ -166,7 +175,10 @@ class Model:
             logits -= logits.max(axis=1, keepdims=True)
             result = np.exp(logits)
             return result / result.sum(axis=1, keepdims=True)
-        return np.maximum(0, logits[:, 0] * self.meta["target_scale"] + self.meta["target_mean"])
+        value = np.maximum(0, logits[:, 0] * self.meta["target_scale"] + self.meta["target_mean"])
+        if "prediction_cap" in self.meta:
+            value = np.minimum(value, self.meta["prediction_cap"])
+        return value
 
     def save(self, path):
         self.validate()

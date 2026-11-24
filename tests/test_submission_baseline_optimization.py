@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,6 +202,107 @@ def test_c_stops_after_three_epochs_without_multiobjective_improvement(
     assert report["early_stopped"] is True
 
 
+@pytest.mark.parametrize("profile", ["A", "B"])
+def test_a_and_b_stop_after_three_epochs_without_improvement(
+        monkeypatch, tmp_path, profile):
+    class FakeModel:
+        def __init__(self, task, paths, classes, x, y, *, hidden, seed,
+                     learning_rate, batch_size):
+            del x, y
+            self.meta = {
+                "task": task, "paths": paths, "classes": classes,
+                "hidden": hidden, "seed": seed, "epochs": 0, "steps": 0,
+                "learning_rate": learning_rate, "batch_size": batch_size,
+                "parameter_count": 1,
+            }
+
+        def validate(self):
+            return None
+
+        def fit(self, x, y, epochs):
+            del x, y
+            self.meta["epochs"] += epochs
+            self.meta["steps"] += epochs
+            return [1.0]
+
+        def save(self, path):
+            Path(path).write_text(f"epoch={self.meta['epochs']}", encoding="utf-8")
+
+    def fake_dataset(path, task, classes, expected_paths=None):
+        del task, classes, expected_paths
+        return {
+            "ids": ["v1"] if "validation" in str(path) else ["t1"],
+            "x": np.array([[1.0]]), "y": np.array([0]),
+            "paths": ['[["key","x"]]'], "sha256": "sha256:data",
+        }
+
+    def fake_metrics(model, data):
+        epoch = model.meta["epochs"]
+        score = 0.9 if epoch == 1 else 0.5
+        if model.meta["task"] == "classification":
+            return {"accuracy": score, "macro_f1": score}
+        return {"mae": 1.0 / score, "rmse": 1.0 / score}
+
+    monkeypatch.setattr(baseline_train, "Model", FakeModel)
+    monkeypatch.setattr(baseline_train, "read_dataset", fake_dataset)
+    monkeypatch.setattr(baseline_train, "metrics", fake_metrics)
+    monkeypatch.setattr(
+        baseline_train, "checkpoint_digest",
+        lambda path: "sha256:" + Path(path).read_text(encoding="utf-8"))
+
+    report = baseline_train.train_run(
+        profile, "train.jsonl", "validation.jsonl", tmp_path / "out", epochs=20)
+
+    assert report["trained_final_epochs"] == 1 + baseline_train.EARLY_STOP_PATIENCE
+    assert report["selected_epoch"] == 1
+    assert report["early_stopped"] is True
+
+
+def test_c_best_epoch_uses_hidden_like_metrics(monkeypatch, tmp_path):
+    class FakeModel:
+        def __init__(self, task, paths, classes, x, y, *, hidden, seed,
+                     learning_rate, batch_size):
+            self.meta = {"task": task, "paths": paths, "classes": classes,
+                         "hidden": hidden, "seed": seed, "epochs": 0, "steps": 0,
+                         "learning_rate": learning_rate, "batch_size": batch_size,
+                         "parameter_count": 1}
+
+        def validate(self):
+            return None
+
+        def fit(self, x, y, epochs):
+            self.meta["epochs"] += epochs
+            return [1.0]
+
+        def save(self, path):
+            Path(path).write_text(f"epoch={self.meta['epochs']}", encoding="utf-8")
+
+    def fake_dataset(path, task, classes, expected_paths=None):
+        y = np.array([100.0, 300.0]) if "validation" in str(path) else np.array([1.0])
+        return {"ids": [f"{path}{i}" for i in range(len(y))], "x": np.ones((len(y), 1)),
+                "y": y, "paths": ['[["key","x"]]'], "sha256": "sha256:data"}
+
+    # 第 1 轮完整集更好、类隐藏集更差；第 2 轮相反
+    full = {0: 50.0, 1: 40.0, 2: 60.0, 3: 70.0}
+    sub = {0: 50.0, 1: 45.0, 2: 30.0, 3: 35.0}
+
+    def fake_metrics(model, data):
+        value = (sub if len(data["y"]) == 1 else full)[model.meta["epochs"]]
+        return {"mae": value, "rmse": value, "nasa_asymmetric_score": 10.0}
+
+    monkeypatch.setattr(baseline_train, "Model", FakeModel)
+    monkeypatch.setattr(baseline_train, "read_dataset", fake_dataset)
+    monkeypatch.setattr(baseline_train, "metrics", fake_metrics)
+    monkeypatch.setattr(baseline_train, "checkpoint_digest",
+                        lambda path: "sha256:" + Path(path).read_text(encoding="utf-8"))
+    report = baseline_train.train_run(
+        "C", "train.jsonl", "validation.jsonl", tmp_path / "out", epochs=3)
+    assert report["selected_epoch"] == 2
+    assert report["validation_after_hidden_like"]["rmse"] == 30.0
+    assert report["validation_after"]["rmse"] == 60.0
+    assert report["validation_before_hidden_like"]["rmse"] == 50.0
+
+
 def test_c_train_run_uses_official_weight_and_nasa_metric(tmp_path):
     train_path = tmp_path / "train.jsonl"
     validation_path = tmp_path / "validation.jsonl"
@@ -225,4 +327,91 @@ def test_c_train_run_uses_official_weight_and_nasa_metric(tmp_path):
     assert saved.meta["overestimate_weight"] == 1.0
     assert report["configuration"]["overestimate_weight"] == 1.0
     assert report["best_validation"]["nasa_asymmetric_score"] >= 0
+
+
+def _regression_model(cap_meta=None):
+    x = np.array([[0.0], [1.0]])
+    model = Model("regression", ["x"], [], x, np.array([0.0, 1.0]), hidden=1,
+                  seed=42, learning_rate=0.001, batch_size=2)
+    for value in model.params.values():
+        value.fill(0.0)
+    model.meta["target_mean"], model.meta["target_scale"] = 300.0, 1.0
+    model.meta.update(cap_meta or {})
+    model.validate()
+    return model
+
+
+def test_prediction_cap_limits_regression_output_and_old_checkpoints_unchanged():
+    x = np.array([[0.0]])
+    assert _regression_model().predict(x)[0] == 300.0
+    assert _regression_model({"prediction_cap": 200}).predict(x)[0] == 200.0
+
+
+def test_target_cap_changes_regression_training_target():
+    x, y = np.array([[0.0], [0.0]]), np.array([400.0, 400.0])
+    capped = _regression_model({"target_cap": 200})
+    plain = _regression_model()
+    capped.fit(x, y, 1)
+    plain.fit(x, y, 1)
+    # 目标 400 截断为 200（低于当前输出 300），梯度方向相反
+    assert capped.params["b2"][0] < 0 < plain.params["b2"][0]
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), True, "200"])
+def test_invalid_regression_cap_is_rejected(value):
+    with pytest.raises(ValueError):
+        _regression_model({"prediction_cap": value})
+
+
+def test_cap_rejected_for_classification():
+    x = np.array([[0.0], [1.0]])
+    model = Model("classification", ["x"], ["a", "b"], x, np.array([0, 1]),
+                  hidden=1, seed=42, learning_rate=0.001, batch_size=2)
+    model.meta["target_cap"] = 200
+    with pytest.raises(ValueError):
+        model.validate()
+
+
+def test_c_train_run_writes_caps_and_hidden_like_metrics(tmp_path):
+    train_path = tmp_path / "train.jsonl"
+    validation_path = tmp_path / "validation.jsonl"
+    train_path.write_text("".join(
+        json.dumps({"id": f"t{i}", "inputs": {"x": float(i)}, "answer": float(i * 60)}) + "\n"
+        for i in range(6)), encoding="utf-8")
+    validation_path.write_text("".join(
+        json.dumps({"id": f"v{i}", "inputs": {"x": float(i)}, "answer": float(i * 100)}) + "\n"
+        for i in range(4)), encoding="utf-8")
+    baseline = tmp_path / "baseline"
+    baseline_train.train_run("C", train_path, validation_path, baseline, epochs=1)
+    parent = Model.load(baseline / "checkpoint.npz")
+    assert parent.meta["prediction_cap"] == 200 and parent.meta["target_cap"] == 200
+
+    report = baseline_train.train_run(
+        "C", train_path, validation_path, tmp_path / "cand",
+        resume=baseline / "checkpoint.npz", epochs=2)
+    assert report["hidden_like_max"] == 200
+    assert report["hidden_like_rows"] == 3          # 0、100、200 三个样本
+    for key in ("validation_before_hidden_like", "validation_after_hidden_like"):
+        assert set(report[key]) == {"mae", "rmse", "nasa_asymmetric_score"}
+    assert report["configuration"]["prediction_cap"] == 200
+
+
+def test_a_train_run_has_no_caps_or_hidden_like_metrics(tmp_path):
+    train_path = tmp_path / "train.jsonl"
+    validation_path = tmp_path / "validation.jsonl"
+    rows = [{"id": f"t{i}", "inputs": {"x": float(i)}, "answer": "a" if i % 2 else "b"}
+            for i in range(4)]
+    train_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    validation_path.write_text("".join(
+        json.dumps({**r, "id": "v" + r["id"]}) + "\n" for r in rows), encoding="utf-8")
+    config = tmp_path / "A.json"
+    config.write_text(json.dumps({"profile": "A", "task": "classification",
+                                  "classes": ["a", "b"], "hidden": 4, "seed": 42,
+                                  "learning_rate": 0.01, "batch_size": 4, "epochs": 1}),
+                      encoding="utf-8")
+    report = baseline_train.train_run(config, train_path, validation_path,
+                                      tmp_path / "out", epochs=1)
+    saved = Model.load(tmp_path / "out" / "checkpoint.npz")
+    assert "prediction_cap" not in saved.meta and "target_cap" not in saved.meta
+    assert report["validation_after_hidden_like"] is None
 
