@@ -220,19 +220,35 @@ def _complete_sdk_loop_count(history):
 
 
 def _should_skip_training(history, parent_artifact_id, dataset_key=None):
-    if str(dataset_key).upper() == "C":
+    profile = str(dataset_key).upper()
+    # A 需要继续搜索；C 在首次出现低价值/有害候选后停止重复试验，保护最差阶段并省算力。
+    if profile == "A":
         return False
-    if _complete_sdk_loop_count(history) < 3 or len(history) < 2:
+    if _complete_sdk_loop_count(history) < 3:
         return False
-    recent = history[-2:]
+    if profile == "C":
+        if not history:
+            return False
+        recent = history[-1:]
+    elif len(history) >= 2:
+        recent = history[-2:]
+    else:
+        return False
     for record in recent:
         config = record.get("configuration") if isinstance(record, dict) else None
         if (not isinstance(config, dict)
                 or config.get("parent_artifact_id") != parent_artifact_id
-                or config.get("resource_action") == "training_skipped"):
+                or (profile != "C" and config.get("resource_action") == "training_skipped")):
             return False
         decision = config.get("platform_decision")
         drift = config.get("platform_drift")
+        if profile == "C":
+            if config.get("resource_action") == "training_skipped":
+                continue
+            if (not isinstance(decision, dict)
+                    or decision.get("reason") in ("candidate_better", "first_round_valid_candidate")):
+                return False
+            continue
         if (not isinstance(decision, dict)
                 or decision.get("reason") in ("candidate_better", "first_round_valid_candidate")
                 or not isinstance(drift, dict) or drift.get("status") == "HARMFUL"):
@@ -345,8 +361,10 @@ def _apply_profile_strategy(dataset_key, round_index, epochs, lr, history,
                 return 3, 0.0005, False, "C_first_submission_followup:恢复首次提交的RMSE_MAE安全续训"
             return 5, 0.001, False, "C_first_submission_start:首轮未上线，重试RMSE_MAE安全起点"
         return 1, lr, False, "C_platform_search:单步续训便于平台反馈归因"
-    if profile == "A" and round_index in (1, 2):
-        return 10, 0.01, False, "A_early_round:前两轮采用已验证的强起点"
+    if profile == "A" and round_index == 1:
+        return 20, 0.005, False, "A_early_round:首轮直接采用正式记录中已验证的高收益配置"
+    if profile == "A" and round_index == 2:
+        return 25, 0.003, False, "A_early_round:第二轮沿用高收益阶段的低学习率精调配置"
     if profile == "B":
         if round_index == 1:
             return 10, 0.001, False, "B_first_submission_start:恢复首次提交的安全起点"
@@ -399,7 +417,8 @@ def _ask_model(rnd, task, metric, history):
     hib = rnd.task.get("metric_direction", "higher" if task == "classification" else "lower") == "higher"
     direction = "越大越好" if hib else "越小越好"
     c_search = str(rnd.dataset_key).upper() == "C"
-    hist = _history_prompt(history, include_all=c_search)
+    # shortcut: only the recent three records enter the prompt; SDK history remains complete.
+    hist = _history_prompt(history, include_all=False)
     request = ('{"learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}'
                if c_search else
                '{"epochs": 整数1-50, "learning_rate": 0到0.1小数, "hypothesis": "一句话理由"}')
@@ -565,8 +584,12 @@ def train(rnd):
     after = report.get("validation_after", {})
 
     # 本地配对检验只作诊断；上线选择严格以平台 submit_candidate 返回摘要为准。
-    _, local_diagnostic = _decide_promote(
-        rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
+    if str(rnd.dataset_key).upper() == "C":
+        # C 的平台 NASA/RMSE 摘要才是正式门控；避免重复加载模型和整批验证，降低资源评分损耗。
+        local_diagnostic = {"source": "platform", "reason": "local_gate_deferred"}
+    else:
+        _, local_diagnostic = _decide_promote(
+            rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
     change = f"从父检查点续训 epochs={epochs} lr={lr if lr is not None else '默认'}"
     seed = int(report.get("seed", 42))
     configuration = {"epochs": epochs, "learning_rate": lr, "model_call_id": call_id,

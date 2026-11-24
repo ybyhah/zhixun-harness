@@ -259,7 +259,7 @@ def test_resource_skip_requires_three_loops_two_rejections_and_no_harmful_drift(
     assert cs._should_skip_training(history, "parent-1") is False
 
 
-def test_c_resource_policy_never_skips_a_platform_round():
+def test_c_resource_policy_skips_after_low_value_history():
     history = [{
         "id": f"r{i}", "selected_artifact_id": "parent-c",
         "configuration": {
@@ -270,7 +270,7 @@ def test_c_resource_policy_never_skips_a_platform_round():
         },
     } for i in range(1, 4)]
     assert cs._should_skip_training(
-        history, "parent-c", dataset_key="C") is False
+        history, "parent-c", dataset_key="C") is True
 
 
 def test_parent_metrics_prefers_matching_parent_artifact():
@@ -326,7 +326,7 @@ def test_c_avoid_repeat_compares_learning_rate_after_epoch_is_fixed():
 def test_a_early_round_strategy_uses_strong_known_start(round_index):
     epochs, lr, reset_optimizer, reason = cs._apply_profile_strategy(
         "A", round_index, 3, 0.0005, [], "parent-a")
-    assert (epochs, lr) == (10, 0.01)
+    assert (epochs, lr) == ((20, 0.005) if round_index == 1 else (25, 0.003))
     assert reset_optimizer is False
     assert "A_early_round" in reason
 
@@ -334,6 +334,18 @@ def test_a_early_round_strategy_uses_strong_known_start(round_index):
 def test_a_third_round_keeps_qwen_proposal():
     assert cs._apply_profile_strategy(
         "A", 3, 7, 0.002, [], "parent-a") == (7, 0.002, False, "")
+
+
+def test_a_does_not_skip_late_round_after_two_stable_rejections():
+    history = [{
+        "configuration": {
+            "parent_artifact_id": "parent-a",
+            "platform_decision": {"reason": "candidate_not_better"},
+            "platform_drift": {"status": "STABLE"},
+            "loop_evidence": {"complete": True},
+        }
+    }] * 2
+    assert cs._should_skip_training(history, "parent-a", dataset_key="A") is False
 
 
 def test_c_first_round_restores_first_submission_safe_start():
@@ -581,7 +593,7 @@ def test_train_promotes_platform_improvement_even_if_local_gate_rejects(monkeypa
     candidate_evidence = rnd.submitted_kwargs["configuration"]["report_evidence"]
     assert rnd.submitted_kwargs["hypothesis"]
     assert rnd.submitted_kwargs["change_summary"]
-    assert candidate_evidence["hypothesis"] == "test；A_early_round:前两轮采用已验证的强起点"
+    assert candidate_evidence["hypothesis"] == "test；A_early_round:第二轮沿用高收益阶段的低学习率精调配置"
     assert candidate_evidence["change_summary"].startswith("从父检查点续训")
     assert candidate_evidence["model_call_ids"] == ["call-1"]
     assert candidate_evidence["candidate_count"] == 1
@@ -639,6 +651,7 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
             },
         })
     rnd = _Round(history, {"macro_f1": 0.81}, round_index=4)
+    rnd.dataset_key = "B"
     monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
     monkeypatch.setattr(
         cs.subprocess, "run",
@@ -657,7 +670,7 @@ def test_train_can_skip_one_low_value_round_after_three_complete_loops(
     assert report["candidate_count"] == 0
 
 
-def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
+def test_train_c_skips_after_low_value_history(monkeypatch, tmp_path):
     history = [{
         "id": f"r{i}", "round_index": i,
         "selected_artifact_id": "parent-1",
@@ -677,29 +690,14 @@ def test_train_c_uses_one_epoch_and_never_resource_skips(monkeypatch, tmp_path):
     rnd.dataset_key = "C"
     rnd.task = {
         "task": "regression", "metric": "rmse", "metric_direction": "lower"}
-    seen = {}
-
-    def run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        cand = tmp_path / "cand"
-        cand.mkdir()
-        (cand / "checkpoint.npz").write_bytes(b"checkpoint")
-        (cand / "training.json").write_text(json.dumps({
-            "seed": 42,
-            "validation_before": {"rmse": 52.0},
-            "validation_after": {"rmse": 51.9},
-        }), encoding="utf-8")
-        return type("Proc", (), {"returncode": 0, "stderr": ""})()
-
     monkeypatch.setenv("CONTEST_WORK", str(tmp_path))
-    monkeypatch.setattr(cs.subprocess, "run", run)
     monkeypatch.setattr(
-        cs, "_decide_promote", lambda *a, **k: (True, {"p": 1.0}))
+        cs.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("C training must be skipped after a low-value round")))
     cs.train(rnd)
 
-    index = seen["cmd"].index("--epochs")
-    assert seen["cmd"][index + 1] == "1"
-    assert rnd.finished["configuration"].get("resource_action") is None
+    assert rnd.finished["selected_artifact_id"] == "parent-1"
+    assert rnd.finished["configuration"]["resource_action"] == "training_skipped"
 
 
 def test_train_can_restore_allowed_platform_history_best(monkeypatch, tmp_path):
