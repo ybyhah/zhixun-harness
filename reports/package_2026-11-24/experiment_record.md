@@ -57,6 +57,8 @@ docker save -o artifacts/submission_image_2026-11-24/zhixun-submit-linux-amd64.t
 
 目标远端：`https://github.com/ybyhah/zhixun-harness.git`
 
+最终源码提交：`70aa05c`（已推送到 `main`）。
+
 本记录对应源码应提交以下内容：
 
 - `submission/` 正式 SDK 代码与 A/B/C 基线
