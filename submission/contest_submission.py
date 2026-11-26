@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 TASKS = ("classification", "regression")
 PREDICT_ARGV = ["python3", "/app/harness.py", "predict"]
@@ -77,35 +78,140 @@ def _ask_model(rnd, task, metric, history):
     return epochs, lr, hypothesis, receipt.call_id
 
 
-def _aggregate_better(task, before, after):
-    """回退口径：报告里的 before/after 单点比较（信息不足则保守保留父模型）。"""
+STALL_SKIP = 3              # 同一父模型连续多少轮无改进后跳过一轮训练
+REGRESSION_EPOCH_CAP = 5    # B/C 第 2 轮起单轮续训 epochs 上限
+NASA_TOLERANCE = 1.05
+# 回归本轮内小网格（来自 scripts/sweep_bc.py 对 B/C 公开集的扫描：B 偏好较大 lr，C 偏好小 lr 短续训）
+INNER_GRID = [(1, 0.0003), (5, 0.0003), (5, 0.001), (1, 0.01), (5, 0.01), (3, 0.003)]  # C：候选 NASA 非对称分不得比父模型差 5% 以上（高估寿命的安全护栏）
+
+
+def _num(value):
+    return isinstance(value, (int, float)) and value == value and not isinstance(value, bool)
+
+
+def _nasa(metrics):
+    for key, value in (metrics or {}).items():
+        if "nasa" in str(key).lower() and _num(value):
+            return float(value)
+    return None
+
+
+def _decide_promote(task, parent_metrics, cand_metrics, report):
+    """候选是否上线。优先用平台 submit_candidate 返回的公开验证摘要（与父模型的平台摘要比），
+    父模型平台摘要缺失（首轮）时回退 training.json 的 before/after。
+    回归任务另加 NASA 护栏：主指标变好但 NASA 明显恶化时拒绝（2026-11-25 正式评测 C 第 9 轮的教训）。
+    """
     key = "macro_f1" if task == "classification" else "rmse"
+    source = "platform"
+    before, after = parent_metrics or {}, cand_metrics or {}
+    if not (_num(before.get(key)) and _num(after.get(key))):
+        source = "training_json"
+        before, after = report.get("validation_before", {}), report.get("validation_after", {})
     vb, va = before.get(key), after.get(key)
-    if not isinstance(vb, (int, float)) or not isinstance(va, (int, float)):
-        return False
-    return va > vb if task == "classification" else va < vb
+    info = {"source": source, "metric": key, "parent": vb, "candidate": va}
+    if not (_num(vb) and _num(va)):
+        return False, {**info, "reason": "metric_missing"}
+    better = va > vb if task == "classification" else va < vb
+    if not better:
+        return False, {**info, "reason": "not_better"}
+    nb, na = _nasa(before), _nasa(after)
+    if nb is not None and na is not None:
+        info.update(parent_nasa=nb, candidate_nasa=na)
+        if na > nb * NASA_TOLERANCE:
+            return False, {**info, "reason": "nasa_veto"}
+    return True, {**info, "reason": "better"}
 
 
-def _decide_promote(rnd, task, parent_ckpt, cand_ckpt, report):
-    """候选是否应上线：先在验证投影上做配对 bootstrap，不可用则回退聚合比较。"""
+def _load_state(rnd):
+    """读取上一轮 /state 里的 harness_state.json（失败则空状态，不中断）。"""
+    try:
+        if rnd.state_path:
+            path = Path(rnd.state_path) / "harness_state.json"
+            if path.is_file():
+                data = json.loads(path.read_text())
+                if isinstance(data, dict):
+                    return data
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _save_state(rnd, state):
+    try:
+        work = Path(os.environ.get("CONTEST_WORK", "/workspace"))
+        target = work / f"state-r{rnd.round_index}"
+        if target.exists():
+            return
+        target.mkdir(parents=True)
+        (target / "harness_state.json").write_text(json.dumps(state, ensure_ascii=False))
+        rnd.save_state(target)
+    except Exception as exc:  # noqa: BLE001 —— 状态只是优化，不让本轮失败
+        print(f"save_state failed: {exc!r}", file=sys.stderr)
+
+
+def _dedupe(epochs, lr, default_lr, tried):
+    """同一父模型、同一 (epochs, lr) 在 seed=42 下结果逐位相同，重跑纯属浪费：
+    确定性换轴（先减半学习率，再缩短 epochs），直到出现未试过的组合。"""
+    cur_lr = lr if lr is not None else default_lr
+    seen = {(int(e), round(float(l), 10)) for e, l in tried}
+    e, l = epochs, cur_lr
+    for step in range(8):
+        if (int(e), round(float(l), 10)) not in seen:
+            break
+        if step % 2 == 0:
+            l = max(LR_RANGE[0], l / 2)
+        else:
+            e = max(1, e - 2)
+    changed = (e, l) != (epochs, cur_lr)
+    return e, (l if changed or lr is not None else None), changed
+
+
+def _run_train(rnd, parent_ckpt, epochs, lr, out):
+    cmd = [sys.executable, "-m", "baselines.train",
+           "--profile", rnd.dataset_key,
+           "--train", rnd.data.train_path, "--validation", rnd.data.validation_path,
+           "--resume", str(parent_ckpt),
+           "--epochs", str(epochs), "--output", str(out),
+           "--stage-id", f"round-{rnd.round_index}"]
+    if lr is not None:
+        cmd += ["--learning-rate", str(lr)]
+    env = {**os.environ, "PYTHONPATH": str(BASELINES_DIR.parent)}
+    return subprocess.run(cmd, cwd=str(BASELINES_DIR.parent), env=env,
+                          capture_output=True, text=True)
+
+
+def _nasa_np(y, p):
+    import numpy as np
+    d = np.clip(p - y, -500, 500)
+    return float(np.sum(np.where(d < 0, np.exp(-d / 13) - 1, np.exp(d / 10) - 1)))
+
+
+def _local_score(task, report, out, parent_ckpt, rnd):
+    """本地验证集打分（越小越好）。回归：RMSE，且 NASA 不得比父模型差 NASA_TOLERANCE 以上。"""
     before, after = report.get("validation_before", {}), report.get("validation_after", {})
-    info = {}
+    if task != "regression":
+        return {"ok": False}
+    rb, ra = before.get("rmse"), after.get("rmse")
+    if not (_num(rb) and _num(ra)):
+        return {"ok": False}
+    info = {"rmse": ra, "key": ra, "ok": ra < rb}
     try:
         if str(BASELINES_DIR.parent) not in sys.path:
             sys.path.insert(0, str(BASELINES_DIR.parent))
         from baselines.model import Model
         from baselines.data import read_dataset
-        from decision import should_promote
-        cand_model = Model.load(str(cand_ckpt))
-        val = read_dataset(rnd.data.validation_path, task, cand_model.meta.get("classes", []))
-        parent_pred = Model.load(str(parent_ckpt)).predict(val["x"])
-        cand_pred = cand_model.predict(val["x"])
-        promote, info = should_promote(parent_pred, cand_pred, val["y"], task)
-        if promote is not None:
-            return promote, info
-    except Exception as exc:  # noqa: BLE001 —— 门控不中断本轮
-        info = {"reason": "pred_failed:" + type(exc).__name__}
-    return _aggregate_better(task, before, after), {"fallback": "aggregate", **info}
+        if "val" not in _MODEL_CACHE:
+            _MODEL_CACHE["val"] = read_dataset(rnd.data.validation_path, "regression", [])
+        val = _MODEL_CACHE["val"]
+        if "parent_nasa" not in _MODEL_CACHE:
+            _MODEL_CACHE["parent_nasa"] = _nasa_np(val["y"], Model.load(str(parent_ckpt)).predict(val["x"]))
+        na = _nasa_np(val["y"], Model.load(str(out / "checkpoint.npz")).predict(val["x"]))
+        info["nasa_local"] = na
+        if rnd.dataset_key == "C" and na > _MODEL_CACHE["parent_nasa"] * NASA_TOLERANCE:
+            info["ok"] = False
+    except Exception as exc:  # noqa: BLE001
+        info["nasa_error"] = type(exc).__name__
+    return info
 
 
 def train(rnd):
@@ -114,21 +220,79 @@ def train(rnd):
     parent_ckpt = rnd.parent.path("checkpoint.npz")          # 摘要校验在 /previous 完成
     history = rnd.history()
     epochs, lr, hypothesis, call_id = _ask_model(rnd, task, metric, history)
+    state = _load_state(rnd)
+    parent_id = rnd.parent.artifact_id
+    parent_metrics = (state.get("metrics") or {}).get(parent_id)
+    tried = (state.get("tried") or {}).get(parent_id, [])
+    try:
+        default_lr = float(json.loads((BASELINES_DIR / "configs" / f"{rnd.dataset_key}.json")
+                                      .read_text())["learning_rate"])
+    except Exception:  # noqa: BLE001
+        default_lr = 0.003
+    stall = int(state.get("stall", 0))
+    if stall >= STALL_SKIP and len(history) >= 3:
+        # 资源效率：同一父模型连续 STALL_SKIP 轮无改进 → 本轮不训练，保留父模型，
+        # 并清零计数，下一轮再以去重后的新组合尝试一次（避免永久停训丢掉后续提升）。
+        _save_state(rnd, {**state, "stall": 0})
+        rnd.finish(
+            selected_artifact_id=parent_id, hypothesis=hypothesis,
+            change_summary=f"连续 {stall} 轮候选未优于父模型，本轮跳过训练以节省资源",
+            reason=(f"资源门控：父模型 {parent_id} 已连续 {stall} 轮未被超越，跳过训练、保留父模型；"
+                    f"模型建议调用 {call_id}。下一轮恢复搜索。")[:3900],
+            configuration={"training_skipped": True, "stall": stall, "model_call_id": call_id},
+            seed=42, history_ids=[h["id"] for h in history],
+            model_call_ids=list(rnd.call_ids))
+        return
+    if task == "regression" and rnd.round_index > 1:
+        epochs = min(epochs, REGRESSION_EPOCH_CAP)   # B/C 历史上 >5 epoch 续训几乎都被拒，纯耗时
+    epochs, lr, deduped = _dedupe(epochs, lr, default_lr, tried)
+    if deduped:
+        hypothesis = (hypothesis + f"；该组合已在同一父模型上试过，确定性换轴为 epochs={epochs} lr={lr}")[:2000]
 
     work = Path(os.environ.get("CONTEST_WORK", "/workspace"))
-    cand = work / "cand"                                      # train_run 要求新目录
-    cmd = [sys.executable, "-m", "baselines.train",
-           "--profile", rnd.dataset_key,
-           "--train", rnd.data.train_path, "--validation", rnd.data.validation_path,
-           "--resume", str(parent_ckpt),
-           "--epochs", str(epochs), "--output", str(cand),
-           "--stage-id", f"round-{rnd.round_index}"]
-    if lr is not None:
-        cmd += ["--learning-rate", str(lr)]
-    env = {**os.environ, "PYTHONPATH": str(BASELINES_DIR.parent)}
-    proc = subprocess.run(cmd, cwd=str(BASELINES_DIR.parent), env=env,
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
+    configs = [(epochs, lr)]
+    if task == "regression":
+        # 回归续训很便宜（B≈0.1s/C≈1s 每 epoch）：本轮内对 Qwen 建议 + 小网格各训一次，
+        # 只提交验证集最好的一个。梯度仍只用训练集，验证集仅用于选择。
+        for e, l in INNER_GRID:
+            if (e, l) not in configs and [e, l] not in tried:
+                configs.append((e, l))
+    proc, cand, chosen, inner = None, None, None, []
+    for idx, (e, l) in enumerate(configs):
+        out = work / f"cand{idx}"
+        p = _run_train(rnd, parent_ckpt, e, l, out)
+        if p.returncode != 0:
+            proc = proc or p
+            continue
+        rep = json.loads((out / "training.json").read_text())
+        score = _local_score(task, rep, out, parent_ckpt, rnd)
+        inner.append({"epochs": e, "learning_rate": l, **score})
+        if score.get("ok") and (chosen is None or score["key"] < chosen[2]["key"]):
+            chosen = (e, l, score, out)
+    if chosen is None and inner and task == "regression":
+        # 本轮所有候选在验证集上都不优于父模型：不提交、保留父模型（省平台测量，避免劣化上线）
+        tried_map = dict(state.get("tried") or {})
+        tried_map[parent_id] = list(tried) + [[i["epochs"], i["learning_rate"] if i["learning_rate"] is not None
+                                               else default_lr] for i in inner]
+        _save_state(rnd, {**state, "tried": tried_map, "stall": stall + 1})
+        rnd.finish(
+            selected_artifact_id=parent_id, hypothesis=hypothesis,
+            change_summary=f"本轮试了 {len(inner)} 组续训超参，验证集均未优于父模型，未提交候选",
+            reason=(f"门控判定：保留父模型。模型建议调用 {call_id}；本轮内搜索="
+                    f"{json.dumps(inner[:8], ensure_ascii=False)}")[:3900],
+            configuration={"inner_search": inner[:16], "model_call_id": call_id, "submitted": False},
+            seed=42, history_ids=[h["id"] for h in history],
+            model_call_ids=list(rnd.call_ids))
+        return
+    if chosen is None and inner:
+        first = next((i for i, c in enumerate(configs) if (work / f"cand{i}" / "training.json").exists()), None)
+        if first is not None:
+            chosen = (configs[first][0], configs[first][1], {}, work / f"cand{first}")
+    if chosen is not None:
+        epochs, lr, _, cand = chosen
+        proc = None
+    if proc is not None or cand is None:
+        proc = proc or SimpleNamespace(returncode=1, stderr="no candidate")
         # 续训失败不让整轮失败（C1 无人干预跑完）：优雅保留父模型并正常结束本轮。
         err = (proc.stderr.strip().splitlines() or ["非零退出"])[-1][:500]
         rnd.finish(
@@ -144,21 +308,36 @@ def train(rnd):
     report = json.loads((cand / "training.json").read_text())
     after = report.get("validation_after", {})
 
-    # 门控：候选是否显著优于父模型；否则保留父模型（抗过拟合/稳定性）
-    promote, decision = _decide_promote(rnd, task, parent_ckpt, cand / "checkpoint.npz", report)
     change = f"从父检查点续训 epochs={epochs} lr={lr if lr is not None else '默认'}"
     seed = int(report.get("seed", 42))
     configuration = {"epochs": epochs, "learning_rate": lr, "model_call_id": call_id,
-                     "validation_after": after, "decision": decision}
+                     "validation_after": after, "deduped": deduped, "inner_search": inner[:16]}
     submitted = rnd.submit_candidate(
         cand, hypothesis=hypothesis, change_summary=change,
         configuration=configuration, seed=seed,
         checkpoint_paths=["checkpoint.npz"], code_paths=[], predict_argv=PREDICT_ARGV)
+    summary = submitted.get("summary") if isinstance(submitted, dict) else None
+    cand_metrics = summary.get("metrics") if isinstance(summary, dict) else None
+    cand_metrics = cand_metrics if isinstance(cand_metrics, dict) else {}
+
+    # 门控：以平台公开验证摘要为准；不优于父模型（或 NASA 明显恶化）则保留父模型
+    promote, decision = _decide_promote(task, parent_metrics, cand_metrics, report)
+    configuration["decision"] = decision
+    configuration["platform_metrics"] = cand_metrics
 
     if promote:
         selected, verdict = submitted["artifact_id"], "采纳候选"
     else:
         selected, verdict = rnd.parent.artifact_id, "保留父模型"
+
+    metrics_map = dict(state.get("metrics") or {})
+    if cand_metrics:
+        metrics_map[submitted["artifact_id"]] = cand_metrics
+    tried_map = dict(state.get("tried") or {})
+    tried_map[parent_id] = list(tried) + [[epochs, lr if lr is not None else default_lr]] + \
+        [[i["epochs"], i["learning_rate"]] for i in inner if i["learning_rate"] is not None]
+    _save_state(rnd, {"metrics": metrics_map, "tried": tried_map,
+                      "stall": 0 if promote else stall + 1})
     reason = (f"门控判定：{verdict}。模型建议调用 {call_id}；"
               f"候选 vs 父模型比较={json.dumps(decision, ensure_ascii=False)}"[:3900])
     rnd.finish(
