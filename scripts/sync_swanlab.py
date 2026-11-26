@@ -9,7 +9,14 @@ import argparse
 import re
 from pathlib import Path
 
-import swanlab
+import sys
+
+# Windows 控制台默认 GBK，swanlab 输出 emoji 会抛 UnicodeEncodeError
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
+import swanlab  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "reports" / "formal_evaluation_results"
