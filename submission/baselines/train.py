@@ -81,6 +81,9 @@ def train_run(profile, train_path, validation_path, output, *, resume=None, epoc
         raise ValueError("resume hidden width must match checkpoint; changing the profile does not migrate weights")
     if resume and config["seed"] != model.meta["seed"]:
         raise ValueError("resume profile must preserve the checkpoint's random seed")
+    if os.environ.get("BASELINE_RESET_OPTIMIZER_MOMENTS") == "1" and config["profile"] == "B":
+        for value in (*model.first.values(), *model.second.values()):
+            value.fill(0.0)
     model.meta["profile"] = config["profile"]
     if bearing_rul:
         model.meta["target_unit"] = "minutes"
@@ -153,7 +156,13 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--stage-id", default="baseline")
     parser.add_argument("--label-provenance", help="Required only for historical B classification profiles: JSON with status and method")
+    parser.add_argument("--reset-optimizer-moments", action="store_true",
+                        help="B only: zero Adam first/second moments after resume (49-point version stagnation switch)")
     args = parser.parse_args()
+    if args.reset_optimizer_moments:
+        if args.profile != "B":
+            parser.error("--reset-optimizer-moments is only supported for B")
+        os.environ["BASELINE_RESET_OPTIMIZER_MOMENTS"] = "1"
     if args.epochs is not None and not 1 <= args.epochs <= 10000:
         parser.error("epochs must be in 1..10000")
     report = train_run(args.profile, args.train, args.validation, args.output, resume=args.resume or args.from_baseline,

@@ -166,7 +166,39 @@ def _dedupe(epochs, lr, default_lr, tried):
     return e, (l if changed or lr is not None else None), changed
 
 
-def _run_train(rnd, parent_ckpt, epochs, lr, out):
+B_SWITCH_SEQUENCE = ((5, 0.001), (3, 0.0005), (8, 0.0003))   # 49 分镜像 B 的停滞换轴序列
+
+
+def _b_strategy(round_index, state, parent_id, tried):
+    """B 专用（移植自 2026-11-22 / 49 分镜像 _apply_profile_strategy 的 B 分支）。
+    返回 (epochs, lr, reset_optimizer_moments, 理由)；None 表示沿用 Qwen 建议。"""
+    if round_index == 1:
+        return 10, 0.001, False, "B_first_submission_start:恢复首次提交的安全起点"
+    if round_index == 2:
+        if state.get("last_promoted"):
+            return 5, 0.001, False, "B_first_submission_followup:恢复首次提交的安全续训"
+        return 10, 0.001, False, "B_first_submission_start:首轮未上线，重试安全起点"
+    if tried and not state.get("last_promoted"):
+        seen = {(int(e), round(float(l), 10)) for e, l in tried}
+        for e, l in B_SWITCH_SEQUENCE:
+            if (e, round(l, 10)) not in seen:
+                return e, l, True, "B_stagnation_switch:上一轮无改善后换轴并重置Adam动量"
+    return None
+
+
+def _c_strategy(round_index, state, parent_id, tried):
+    """C 专用（来自 2026-11-25 / 54.84 分镜像的 C 逐轮配置：首轮 10 epochs lr 0.01，随后 5 epochs lr 0.001）。
+    返回 (epochs, lr, reset_optimizer_moments, 理由)；None 表示沿用 Qwen 建议。"""
+    if round_index == 1:
+        return 10, 0.01, False, "C_best_start:沿用 54.84 分版首轮配置"
+    if round_index == 2:
+        if state.get("last_promoted"):
+            return 5, 0.001, False, "C_best_followup:沿用 54.84 分版第二轮续训"
+        return 10, 0.01, False, "C_best_start:首轮未上线，重试起点"
+    return None
+
+
+def _run_train(rnd, parent_ckpt, epochs, lr, out, reset_moments=False):
     cmd = [sys.executable, "-m", "baselines.train",
            "--profile", rnd.dataset_key,
            "--train", rnd.data.train_path, "--validation", rnd.data.validation_path,
@@ -175,6 +207,8 @@ def _run_train(rnd, parent_ckpt, epochs, lr, out):
            "--stage-id", f"round-{rnd.round_index}"]
     if lr is not None:
         cmd += ["--learning-rate", str(lr)]
+    if reset_moments:
+        cmd.append("--reset-optimizer-moments")
     env = {**os.environ, "PYTHONPATH": str(BASELINES_DIR.parent)}
     return subprocess.run(cmd, cwd=str(BASELINES_DIR.parent), env=env,
                           capture_output=True, text=True)
@@ -243,15 +277,36 @@ def train(rnd):
             seed=42, history_ids=[h["id"] for h in history],
             model_call_ids=list(rnd.call_ids))
         return
-    if task == "regression" and rnd.round_index > 1:
-        epochs = min(epochs, REGRESSION_EPOCH_CAP)   # B/C 历史上 >5 epoch 续训几乎都被拒，纯耗时
-    epochs, lr, deduped = _dedupe(epochs, lr, default_lr, tried)
-    if deduped:
-        hypothesis = (hypothesis + f"；该组合已在同一父模型上试过，确定性换轴为 epochs={epochs} lr={lr}")[:2000]
+    key = str(rnd.dataset_key).upper()
+    is_b = key == "B"
+    fixed = key in ("B", "C")        # B/C 走固定策略序列，每轮提交候选，不做本地小网格筛选
+    reset_moments = False
+    deduped = False
+    if fixed:
+        # B：2026-11-22（49 分）镜像的固定起点 + 停滞换轴并重置 Adam 动量（隐藏集 RMSE 最低）
+        # C：2026-11-25（54.84 分）镜像的起点 (10, 0.01) → (5, 0.001)（隐藏集 RMSE/NASA 最好）
+        cfg = (_b_strategy if is_b else _c_strategy)(rnd.round_index, state, parent_id, tried)
+        if cfg is not None:
+            epochs, lr, reset_moments, why = cfg
+            hypothesis = (hypothesis + f"；{why}")[:2000]
+        else:
+            if not is_b:
+                epochs = min(epochs, REGRESSION_EPOCH_CAP)
+            # 固定序列用完后沿用 Qwen 建议，但避免同一父模型重复组合
+            epochs, lr, deduped = _dedupe(epochs, lr, default_lr, tried)
+    elif task == "regression":
+        epochs = min(epochs, REGRESSION_EPOCH_CAP) if rnd.round_index > 1 else epochs
+        epochs, lr, deduped = _dedupe(epochs, lr, default_lr, tried)
+        if deduped:
+            hypothesis = (hypothesis + f"；该组合已在同一父模型上试过，确定性换轴为 epochs={epochs} lr={lr}")[:2000]
+    else:
+        epochs, lr, deduped = _dedupe(epochs, lr, default_lr, tried)
+        if deduped:
+            hypothesis = (hypothesis + f"；该组合已在同一父模型上试过，确定性换轴为 epochs={epochs} lr={lr}")[:2000]
 
     work = Path(os.environ.get("CONTEST_WORK", "/workspace"))
     configs = [(epochs, lr)]
-    if task == "regression":
+    if task == "regression" and not fixed:
         # 回归续训很便宜（B≈0.1s/C≈1s 每 epoch）：本轮内对 Qwen 建议 + 小网格各训一次，
         # 只提交验证集最好的一个。梯度仍只用训练集，验证集仅用于选择。
         for e, l in INNER_GRID:
@@ -260,7 +315,7 @@ def train(rnd):
     proc, cand, chosen, inner = None, None, None, []
     for idx, (e, l) in enumerate(configs):
         out = work / f"cand{idx}"
-        p = _run_train(rnd, parent_ckpt, e, l, out)
+        p = _run_train(rnd, parent_ckpt, e, l, out, reset_moments=reset_moments)
         if p.returncode != 0:
             proc = proc or p
             continue
@@ -269,6 +324,9 @@ def train(rnd):
         inner.append({"epochs": e, "learning_rate": l, **score})
         if score.get("ok") and (chosen is None or score["key"] < chosen[2]["key"]):
             chosen = (e, l, score, out)
+    if fixed and inner and chosen is None:
+        # B/C 与历史最优版一致：每轮都提交候选，由平台摘要门控（含 C 的 NASA 护栏）决定是否上线
+        chosen = (configs[0][0], configs[0][1], {}, work / "cand0")
     if chosen is None and inner and task == "regression":
         # 本轮所有候选在验证集上都不优于父模型：不提交、保留父模型（省平台测量，避免劣化上线）
         tried_map = dict(state.get("tried") or {})
@@ -337,7 +395,7 @@ def train(rnd):
     tried_map[parent_id] = list(tried) + [[epochs, lr if lr is not None else default_lr]] + \
         [[i["epochs"], i["learning_rate"]] for i in inner if i["learning_rate"] is not None]
     _save_state(rnd, {"metrics": metrics_map, "tried": tried_map,
-                      "stall": 0 if promote else stall + 1})
+                      "stall": 0 if promote else stall + 1, "last_promoted": bool(promote)})
     reason = (f"门控判定：{verdict}。模型建议调用 {call_id}；"
               f"候选 vs 父模型比较={json.dumps(decision, ensure_ascii=False)}"[:3900])
     rnd.finish(
